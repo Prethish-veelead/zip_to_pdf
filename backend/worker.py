@@ -86,6 +86,52 @@ def process_job(job_id: str, selected_pages: list[int] | None = None, page_size:
     thread.start()
 
 
+def page_thumbnail_path(job_id: str, page: int) -> Path:
+    return UPLOAD_DIR / job_id / "page_thumbs" / f"page_{page:04d}.jpg"
+
+
+def generate_page_previews(job_id: str) -> list[dict]:
+    conn = get_conn()
+    zips = conn.execute(
+        "SELECT * FROM job_zips WHERE job_id = ? ORDER BY zip_order", (job_id,)
+    ).fetchall()
+    conn.close()
+
+    pages = []
+    global_idx = 0
+    
+    thumb_dir = UPLOAD_DIR / job_id / "page_thumbs"
+    thumb_dir.mkdir(parents=True, exist_ok=True)
+
+    for zip_row in zips:
+        try:
+            with zipfile.ZipFile(zip_row["stored_path"], "r") as zf:
+                for name in _valid_names(zf):
+                    global_idx += 1
+                    thumb_path = page_thumbnail_path(job_id, global_idx)
+                    
+                    if not thumb_path.exists():
+                        try:
+                            with zf.open(name) as f:
+                                img = Image.open(io.BytesIO(f.read()))
+                                img.load()
+                            img = _to_rgb(img)
+                            img.thumbnail(THUMBNAIL_SIZE, Image.LANCZOS)
+                            img.save(str(thumb_path), "JPEG", quality=85)
+                        except Exception as e:
+                            print(f"[worker] thumbnail failed for {name}: {e}")
+
+                    pages.append({
+                        "page": global_idx,
+                        "zipName": zip_row["zip_name"],
+                        "imageName": Path(name).name
+                    })
+        except Exception as e:
+            print(f"[worker] zip open failed {zip_row['zip_name']}: {e}")
+
+    return pages
+
+
 # ── background worker ─────────────────────────────────────────────────────────
 
 def _run_job(job_id: str, selected_pages: list[int] | None, page_size: str):
