@@ -27,7 +27,7 @@ app = FastAPI(title="ZipForge API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten in production
+    allow_origins=["*", "https://zip-to-pdf-sigma.vercel.app"],   # tighten in production
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -157,6 +157,7 @@ class ReorderBody(BaseModel):
 class StartBody(BaseModel):
     fileName: str | None = None
     selected_pages: List[int] | None = None
+    page_size: str | None = "smart"
 
 
 @app.put("/api/jobs/{job_id}/order")
@@ -214,14 +215,16 @@ async def start_job(job_id: str, body: StartBody | None = None):
         if selected_pages[0] < 1 or selected_pages[-1] > total_pages:
             raise HTTPException(400, "Selected pages are outside the preview range")
 
+    page_size = body.page_size if body and body.page_size else "smart"
+
     conn.execute(
-        "UPDATE jobs SET status='pending', output_name=? WHERE id=?",
-        (output_name, job_id),
+        "UPDATE jobs SET status='pending', output_name=?, page_size=? WHERE id=?",
+        (output_name, page_size, job_id),
     )
     conn.commit()
     conn.close()
 
-    process_job(job_id, selected_pages)
+    process_job(job_id, selected_pages, page_size)
     return {"success": True, "jobId": job_id}
 
 

@@ -1,5 +1,5 @@
 import sqlite3
-from zip_to_pdf.backend.config import BASE_DIR
+from config import BASE_DIR
 
 DB_PATH = BASE_DIR / "jobs.db"
 
@@ -20,10 +20,24 @@ def init_db():
             progress    INTEGER DEFAULT 0,
             progress_msg TEXT   DEFAULT '',
             total_images INTEGER DEFAULT 0,
+            output_name TEXT,
+            page_size   TEXT    DEFAULT 'smart',
             pdf_path    TEXT,
             pdf_size    INTEGER,
             error       TEXT
         );
+    """)
+    
+    # Run migrations if columns are missing
+    try:
+        conn.execute("ALTER TABLE jobs ADD COLUMN output_name TEXT")
+    except sqlite3.OperationalError:
+        pass
+        
+    try:
+        conn.execute("ALTER TABLE jobs ADD COLUMN page_size TEXT DEFAULT 'smart'")
+    except sqlite3.OperationalError:
+        pass
 
         CREATE TABLE IF NOT EXISTS job_zips (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,

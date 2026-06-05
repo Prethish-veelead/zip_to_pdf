@@ -2,14 +2,15 @@ import io
 import zipfile
 import threading
 from pathlib import Path
+from collections import Counter
 
 import natsort
 from PIL import Image
 from reportlab.pdfgen import canvas as pdf_canvas
 from reportlab.lib.utils import ImageReader
 
-from zip_to_pdf.backend.config import UPLOAD_DIR, ALLOWED_IMAGE_EXTS, THUMBNAIL_SIZE, DEFAULT_DPI
-from zip_to_pdf.backend.database import get_conn
+from config import UPLOAD_DIR, ALLOWED_IMAGE_EXTS, THUMBNAIL_SIZE, DEFAULT_DPI
+from database import get_conn
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -79,15 +80,15 @@ def generate_thumbnail(zip_path: str, job_id: str, zip_order: int) -> str | None
         return None
 
 
-def process_job(job_id: str):
+def process_job(job_id: str, selected_pages: list[int] | None = None, page_size: str = "smart"):
     """Kick off background PDF generation thread."""
-    thread = threading.Thread(target=_run_job, args=(job_id,), daemon=True)
+    thread = threading.Thread(target=_run_job, args=(job_id, selected_pages, page_size), daemon=True)
     thread.start()
 
 
 # ── background worker ─────────────────────────────────────────────────────────
 
-def _run_job(job_id: str):
+def _run_job(job_id: str, selected_pages: list[int] | None, page_size: str):
     conn = get_conn()
     try:
         zips = conn.execute(
@@ -96,7 +97,8 @@ def _run_job(job_id: str):
         ).fetchall()
 
         output_path = UPLOAD_DIR / job_id / "output.pdf"
-        total = sum(z["image_count"] for z in zips)
+        pages_to_process = set(selected_pages) if selected_pages else None
+        total = len(pages_to_process) if pages_to_process else sum(z["image_count"] for z in zips)
 
         conn.execute(
             "UPDATE jobs SET status='processing', total_images=?, progress=0 WHERE id=?",
@@ -104,12 +106,52 @@ def _run_job(job_id: str):
         )
         conn.commit()
 
+        target_w, target_h = None, None
+
+        if page_size == "smart":
+            conn.execute("UPDATE jobs SET progress_msg='Analyzing dimensions...' WHERE id=?", (job_id,))
+            conn.commit()
+            
+            dim_counts = Counter()
+            scan_idx = 0
+            
+            for zip_row in zips:
+                with zipfile.ZipFile(zip_row["stored_path"], "r") as zf:
+                    for name in _valid_names(zf):
+                        scan_idx += 1
+                        if pages_to_process and scan_idx not in pages_to_process:
+                            continue
+                            
+                        try:
+                            with zf.open(name) as f:
+                                img = Image.open(io.BytesIO(f.read()))
+                                w_pts, h_pts = _img_pts(img)
+                                
+                                bucket_w = round(w_pts / 5.0) * 5
+                                bucket_h = round(h_pts / 5.0) * 5
+                                dim_counts[(bucket_w, bucket_h)] += 1
+                                img.close()
+                        except Exception:
+                            pass
+                            
+            if dim_counts:
+                best_dim = dim_counts.most_common(1)[0][0]
+                target_w, target_h = best_dim
+                
+        elif page_size == "a4":
+            target_w, target_h = 595.27, 841.89
+
         c = pdf_canvas.Canvas(str(output_path))
         processed = 0
+        global_page_idx = 0
 
         for zip_row in zips:
             with zipfile.ZipFile(zip_row["stored_path"], "r") as zf:
                 for name in _valid_names(zf):
+                    global_page_idx += 1
+                    if pages_to_process and global_page_idx not in pages_to_process:
+                        continue
+
                     try:
                         with zf.open(name) as f:
                             img = Image.open(io.BytesIO(f.read()))
@@ -118,8 +160,18 @@ def _run_job(job_id: str):
                         img = _to_rgb(img)
                         w_pts, h_pts = _img_pts(img)
 
-                        c.setPageSize((w_pts, h_pts))
-                        c.drawImage(ImageReader(img), 0, 0, w_pts, h_pts)
+                        if target_w and target_h:
+                            c.setPageSize((target_w, target_h))
+                            scale = min(target_w / w_pts, target_h / h_pts)
+                            draw_w = w_pts * scale
+                            draw_h = h_pts * scale
+                            x = (target_w - draw_w) / 2.0
+                            y = (target_h - draw_h) / 2.0
+                            c.drawImage(ImageReader(img), x, y, draw_w, draw_h)
+                        else:
+                            c.setPageSize((w_pts, h_pts))
+                            c.drawImage(ImageReader(img), 0, 0, w_pts, h_pts)
+                            
                         c.showPage()
                         img.close()
 

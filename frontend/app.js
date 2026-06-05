@@ -25,6 +25,7 @@ const state = {
   pdfSize:    0,
   pdfName:    '',
   pdfNameDirty:false,
+  pageSize:   'smart',
 };
 
 /* ── Utilities ───────────────────────────────────────────────────────────── */
@@ -454,6 +455,33 @@ function renderPreview() {
       <p>Check thumbnails and choose which images should be included.</p>
     </div>
 
+    <div class="page-size-selector">
+      <h3>Page Size</h3>
+      <div class="radio-group">
+        <label class="radio-label">
+          <input type="radio" name="page-size" value="original" ${state.pageSize === 'original' ? 'checked' : ''}>
+          <div class="radio-content">
+            <span class="radio-title">Original</span>
+            <span class="radio-desc">Dimensions vary per image</span>
+          </div>
+        </label>
+        <label class="radio-label">
+          <input type="radio" name="page-size" value="a4" ${state.pageSize === 'a4' ? 'checked' : ''}>
+          <div class="radio-content">
+            <span class="radio-title">A4</span>
+            <span class="radio-desc">Fit into standard A4 sheets</span>
+          </div>
+        </label>
+        <label class="radio-label recommended">
+          <input type="radio" name="page-size" value="smart" ${state.pageSize === 'smart' ? 'checked' : ''}>
+          <div class="radio-content">
+            <span class="radio-title">Smart Auto Size <span class="tag-rec">Recommended</span></span>
+            <span class="radio-desc">Detect most suitable uniform size</span>
+          </div>
+        </label>
+      </div>
+    </div>
+
     <div class="preview-toolbar">
       <div>
         <span class="tag" id="selected-count">${selected.toLocaleString()} selected</span>
@@ -501,6 +529,12 @@ function pageCardHtml(p) {
 function initPreviewEvents() {
   qs('#preview-back-btn').addEventListener('click', () => goto('review'));
   qs('#generate-btn').addEventListener('click', doGenerate);
+  
+  qsa('input[name="page-size"]').forEach(el => {
+    el.addEventListener('change', e => {
+      if (e.target.checked) state.pageSize = e.target.value;
+    });
+  });
   qs('#select-all-btn').addEventListener('click', () => {
     state.selectedPages = new Set(state.pages.map(p => p.page));
     renderPreview();
@@ -556,7 +590,7 @@ async function doGenerate() {
     const res = await fetch(`${API_BASE}/api/jobs/${state.jobId}/start`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ fileName: outputName, selected_pages: pages }),
+      body: JSON.stringify({ fileName: outputName, selected_pages: pages, page_size: state.pageSize }),
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
@@ -720,7 +754,7 @@ function resetApp() {
   Object.assign(state, {
     step:'upload', jobId:null, zips:[], pages:[], selectedPages:new Set(), selected:[],
     pollTimer:null, startTime:null, totalImages:0, pdfSize:0,
-    pdfName:'', pdfNameDirty:false
+    pdfName:'', pdfNameDirty:false, pageSize:'smart'
   });
   goto('upload');
 }
