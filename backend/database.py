@@ -26,19 +26,6 @@ def init_db():
             pdf_size    INTEGER,
             error       TEXT
         );
-    """)
-    
-    # Run migrations if columns are missing
-    try:
-        conn.execute("ALTER TABLE jobs ADD COLUMN output_name TEXT")
-    except sqlite3.OperationalError:
-        pass
-        
-    try:
-        conn.execute("ALTER TABLE jobs ADD COLUMN page_size TEXT DEFAULT 'smart'")
-    except sqlite3.OperationalError:
-        pass
-
         CREATE TABLE IF NOT EXISTS job_zips (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             job_id          TEXT    NOT NULL,
@@ -51,5 +38,16 @@ def init_db():
             FOREIGN KEY (job_id) REFERENCES jobs(id)
         );
     """)
+    
+    # Run migrations if columns are missing
+    try:
+        conn.execute("ALTER TABLE jobs ADD COLUMN output_name TEXT")
+    except sqlite3.OperationalError:
+        pass
+        
+    try:
+        conn.execute("ALTER TABLE jobs ADD COLUMN page_size TEXT DEFAULT 'smart'")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
