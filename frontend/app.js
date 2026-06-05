@@ -1,5 +1,6 @@
 /* ── Config ──────────────────────────────────────────────────────────────── */
 const API_BASE = (() => {
+  if (window.location.hostname.includes('vercel.app')) return 'https://zip-to-pdf.onrender.com';
   if (window.location.protocol === 'file:') return 'http://127.0.0.1:8000';
   const p = window.location.port;
   return (p && p !== '8000') ? 'http://127.0.0.1:8000' : '';
