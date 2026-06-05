@@ -1,0 +1,56 @@
+# Python cache
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Distribution / build
+build/
+dist/
+*.egg-info/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Runtime data
+backend/uploads/
+backend/jobs.db
+backend/*.db
+uploads/
+temp/
+tmp/
+
+# Frontend dependencies/build output
+node_modules/
+.parcel-cache/
+.vite/
+coverage/
+
+# Local app files
+*.sqlite
+*.sqlite3
