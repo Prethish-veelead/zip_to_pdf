@@ -86,6 +86,24 @@ input  { font-family: inherit; }
   letter-spacing: -0.5px;
 }
 
+.btn-clear-cache {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: var(--error-dim);
+  color: var(--error);
+  border: 1px solid rgba(255, 77, 106, 0.2);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all var(--transition);
+}
+.btn-clear-cache:hover {
+  background: rgba(255, 77, 106, 0.2);
+}
+
 /* ── Step Nav ────────────────────────────────────────────────────────────── */
 .step-nav {
   display: flex;

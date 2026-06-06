@@ -1,32 +1,24 @@
 /* ── Config ──────────────────────────────────────────────────────────────── */
-const API_BASE = (() => {
-  if (window.location.hostname.includes('vercel.app')) return 'https://zip-to-pdf.onrender.com';
-  if (window.location.protocol === 'file:') return 'http://127.0.0.1:8000';
-  const p = window.location.port;
-  return (p && p !== '8000') ? 'http://127.0.0.1:8000' : '';
-})();
-
 const MAX_FILE_MB  = 300;
 const MAX_FILES    = 30;
 const MAX_PDF_NAME_LEN = 100;
-const POLL_MS      = 2000;
 const INVALID_FILENAME_CHARS = /[\\/:*?"<>|]/g;
 
 /* ── State ───────────────────────────────────────────────────────────────── */
 const state = {
-  step:       'upload',   // 'upload' | 'review' | 'preview' | 'processing' | 'complete'
-  jobId:      null,
-  zips:       [],         // [{id, name, size, imageCount, order, hasThumbnail}]
-  pages:      [],         // [{page, zipName, imageName, thumbnailUrl}]
+  step:       'upload',
+  zips:       [],         // [{id, name, size, imageCount, order, fileObj, validImages: []}]
+  pages:      [],         // [{page, zipId, zipName, imageName, entryName, thumbnailUrl}]
   selectedPages:new Set(),
   selected:   [],         // File objects chosen but not yet uploaded
-  pollTimer:  null,
   startTime:  null,
   totalImages:0,
   pdfSize:    0,
   pdfName:    '',
   pdfNameDirty:false,
   pageSize:   'smart',
+  pdfBlobUrl: null,       // URL for the generated PDF to download
+  isGenerating: false
 };
 
 /* ── Utilities ───────────────────────────────────────────────────────────── */
@@ -95,6 +87,40 @@ function toast(msg, type = 'info', dur = 4000) {
   setTimeout(() => el.remove(), dur);
 }
 
+/* ── Memory Management (Clear Cache) ─────────────────────────────────────── */
+function clearCache() {
+  // Revoke all object URLs to free memory
+  if (state.pdfBlobUrl) {
+    URL.revokeObjectURL(state.pdfBlobUrl);
+    state.pdfBlobUrl = null;
+  }
+  
+  for (const page of state.pages) {
+    if (page.thumbnailUrl) {
+      URL.revokeObjectURL(page.thumbnailUrl);
+      page.thumbnailUrl = null;
+    }
+  }
+
+  for (const zip of state.zips) {
+    if (zip.thumbnailUrl) {
+      URL.revokeObjectURL(zip.thumbnailUrl);
+      zip.thumbnailUrl = null;
+    }
+  }
+
+  // Reset state
+  Object.assign(state, {
+    zips: [], pages: [], selectedPages: new Set(), selected: [],
+    startTime: null, totalImages: 0, pdfSize: 0,
+    pdfName: '', pdfNameDirty: false, pageSize: 'smart',
+    isGenerating: false
+  });
+
+  goto('upload');
+  toast('Cache cleared and memory freed.', 'success');
+}
+
 /* ── SVG Icons ───────────────────────────────────────────────────────────── */
 const icons = {
   upload: `<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>`,
@@ -140,13 +166,40 @@ function renderStepNav() {
   }).join('');
 }
 
+/* ── JSZip Helpers ───────────────────────────────────────────────────────── */
+const VALID_EXT = ['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif'];
+
+function isValidImage(filename) {
+  if (filename.startsWith('__MACOSX/') || filename.includes('/.')) return false;
+  const ext = filename.toLowerCase().match(/\.[a-z0-9]+$/);
+  return ext && VALID_EXT.includes(ext[0]);
+}
+
+async function createThumbnailBlob(zipFileObj, entryName) {
+  try {
+    const zip = await JSZip.loadAsync(zipFileObj);
+    const file = zip.file(entryName);
+    if (!file) return null;
+    
+    // Get array buffer, make blob
+    const buffer = await file.async("arraybuffer");
+    let ext = entryName.split('.').pop().toLowerCase();
+    if (ext === 'jpg') ext = 'jpeg';
+    const blob = new Blob([buffer], { type: `image/${ext}` });
+    return URL.createObjectURL(blob);
+  } catch (e) {
+    console.error("Thumbnail error:", e);
+    return null;
+  }
+}
+
 /* ── Step: Upload ────────────────────────────────────────────────────────── */
 function renderUpload() {
   const main = qs('#main-content');
   main.innerHTML = `
     <div class="section-heading">
       <h1>Convert ZIPs to PDF</h1>
-      <p>Upload your ZIP files — we'll stack all images into one clean PDF.</p>
+      <p>Upload your ZIP files — we'll stack all images into one clean PDF offline.</p>
     </div>
 
     <div class="upload-zone" id="drop-zone" role="button" tabindex="0" aria-label="Upload ZIP files">
@@ -172,6 +225,7 @@ function renderUpload() {
   `;
 
   initUploadZone();
+  qs('#clear-cache-btn')?.addEventListener('click', clearCache);
 }
 
 function initUploadZone() {
@@ -239,20 +293,29 @@ function refreshChips() {
 async function doUpload() {
   const btn = qs('#upload-btn');
   btn.disabled = true;
-  btn.textContent = 'Uploading…';
+  btn.textContent = 'Reading ZIP headers…';
 
-  const fd = new FormData();
-  state.selected.forEach(f => fd.append('files', f));
-
+  state.zips = [];
   try {
-    const res = await fetch(`${API_BASE}/api/jobs`, { method: 'POST', body: fd });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.detail || 'Upload failed');
+    for (let i = 0; i < state.selected.length; i++) {
+      const f = state.selected[i];
+      const zip = await JSZip.loadAsync(f);
+      const validImages = Object.keys(zip.files)
+        .filter(isValidImage)
+        .sort(); // sort by name alphabetically
+
+      state.zips.push({
+        id: i,
+        name: f.name,
+        size: f.size,
+        imageCount: validImages.length,
+        order: i,
+        fileObj: f,
+        validImages: validImages,
+        thumbnailUrl: null
+      });
     }
-    const data = await res.json();
-    state.jobId = data.jobId;
-    state.zips  = data.zips;
+
     state.pages = [];
     state.selectedPages = new Set();
     state.selected = [];
@@ -260,7 +323,8 @@ async function doUpload() {
     syncDefaultPdfName(true);
     goto('review');
   } catch (e) {
-    toast(e.message, 'error');
+    toast('Error reading ZIP files. Are they corrupted?', 'error');
+    console.error(e);
     btn.disabled  = false;
     btn.innerHTML = `Continue ${icons.arrow}`;
   }
@@ -314,7 +378,7 @@ function renderReview() {
   `;
 
   initSortable();
-  lazyLoadThumbnails();
+  lazyLoadZipThumbnails();
 
   qs('#pdf-name-input').addEventListener('input', e => {
     const cleaned = sanitizePdfBase(e.target.value);
@@ -328,16 +392,7 @@ function renderReview() {
     e.target.value = state.pdfName;
   });
 
-  qs('#back-btn').addEventListener('click', () => {
-    state.jobId = null;
-    state.zips  = [];
-    state.pages = [];
-    state.selectedPages = new Set();
-    state.pdfName = '';
-    state.pdfNameDirty = false;
-    goto('upload');
-  });
-
+  qs('#back-btn').addEventListener('click', clearCache);
   qs('#generate-btn').addEventListener('click', doPreview);
 }
 
@@ -359,15 +414,23 @@ function zipCardHtml(z) {
     </div>`;
 }
 
-function lazyLoadThumbnails() {
-  state.zips.forEach((z, order) => {
-    if (!z.hasThumbnail) return;
+async function lazyLoadZipThumbnails() {
+  for (const z of state.zips) {
+    if (z.imageCount === 0) continue;
+    
+    // Check if we already created one
+    if (!z.thumbnailUrl) {
+      const firstEntry = z.validImages[0];
+      z.thumbnailUrl = await createThumbnailBlob(z.fileObj, firstEntry);
+    }
+    
     const el = qs(`#thumb-${z.id}`);
-    if (!el) return;
-    const img = new Image();
-    img.src = `${API_BASE}/api/jobs/${state.jobId}/thumbnail/${order}`;
-    img.onload = () => { el.innerHTML = ''; el.appendChild(img); };
-  });
+    if (el && z.thumbnailUrl) {
+      const img = new Image();
+      img.src = z.thumbnailUrl;
+      img.onload = () => { el.innerHTML = ''; el.appendChild(img); };
+    }
+  }
 }
 
 function initSortable() {
@@ -393,23 +456,8 @@ function initSortable() {
 
       syncDefaultPdfName();
       updatePdfNameInput();
-
-      // Persist to backend
-      saveOrder(newOrder);
     }
   });
-}
-
-async function saveOrder(idList) {
-  try {
-    await fetch(`${API_BASE}/api/jobs/${state.jobId}/order`, {
-      method:  'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ order: idList }),
-    });
-  } catch {
-    toast('Could not save order — check connection', 'error');
-  }
 }
 
 async function doPreview() {
@@ -424,28 +472,39 @@ async function doPreview() {
   state.pdfName = stripExt(outputName, '.pdf');
   updatePdfNameInput();
   btn.disabled = true;
-  btn.textContent = 'Preparing preview...';
+  btn.textContent = 'Extracting Previews...';
 
   try {
-    const res = await fetch(`${API_BASE}/api/jobs/${state.jobId}/pages`);
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.detail || 'Could not prepare preview');
+    // Generate page objects across all ordered zips
+    state.pages = [];
+    let globalIdx = 1;
+    
+    // Sort zips by order just in case
+    const sortedZips = [...state.zips].sort((a,b) => a.order - b.order);
+
+    for (const z of sortedZips) {
+      for (const entryName of z.validImages) {
+        state.pages.push({
+          page: globalIdx++,
+          zipId: z.id,
+          zipName: z.name,
+          imageName: entryName.split('/').pop(),
+          entryName: entryName,
+          thumbnailUrl: null // will be lazy loaded
+        });
+      }
     }
-    const data = await res.json();
-    state.pages = data.pages.map(p => ({
-      ...p,
-      thumbnailUrl: `${API_BASE}${p.thumbnailUrl}`,
-    }));
+
     state.selectedPages = new Set(state.pages.map(p => p.page));
     goto('preview');
   } catch (e) {
-    toast(e.message, 'error');
+    toast('Failed to prepare preview', 'error');
     btn.disabled = false;
     btn.innerHTML = `Preview Pages ${icons.arrow}`;
   }
 }
 
+/* ── Step: Preview ───────────────────────────────────────────────────────── */
 function renderPreview() {
   const selected = state.selectedPages.size;
   const total = state.pages.length;
@@ -509,6 +568,7 @@ function renderPreview() {
   `;
 
   initPreviewEvents();
+  lazyLoadAllPageThumbnails();
 }
 
 function pageCardHtml(p) {
@@ -519,12 +579,44 @@ function pageCardHtml(p) {
         <span>Page ${p.page}</span>
         <input class="page-check" type="checkbox" data-page="${p.page}" ${checked} />
       </div>
-      <div class="page-thumb">
-        <img src="${escapeAttr(p.thumbnailUrl)}" alt="Page ${p.page}" loading="lazy" />
+      <div class="page-thumb" id="page-thumb-${p.page}">
+        ${p.thumbnailUrl ? `<img src="${p.thumbnailUrl}" loading="lazy" />` : `<span class="thumb-placeholder">${icons.image}</span>`}
       </div>
-      <div class="page-name" title="${escapeAttr(p.imagePath || p.imageName)}">${escapeHtml(p.imageName)}</div>
+      <div class="page-name" title="${escapeAttr(p.entryName)}">${escapeHtml(p.imageName)}</div>
       <div class="page-zip" title="${escapeAttr(p.zipName)}">${escapeHtml(p.zipName)}</div>
     </label>`;
+}
+
+async function lazyLoadAllPageThumbnails() {
+  // Use a map to cache zip instances for this loop so we don't reload async 100 times
+  const zipCache = {};
+  for (const p of state.pages) {
+    if (p.thumbnailUrl) continue; // already loaded
+
+    const zipState = state.zips.find(z => z.id === p.zipId);
+    if (!zipCache[p.zipId]) {
+      zipCache[p.zipId] = await JSZip.loadAsync(zipState.fileObj);
+    }
+    const zip = zipCache[p.zipId];
+    
+    try {
+      const file = zip.file(p.entryName);
+      if (file) {
+        const buffer = await file.async("arraybuffer");
+        let ext = p.entryName.split('.').pop().toLowerCase();
+        if (ext === 'jpg') ext = 'jpeg';
+        const blob = new Blob([buffer], { type: `image/${ext}` });
+        p.thumbnailUrl = URL.createObjectURL(blob);
+
+        const el = qs(`#page-thumb-${p.page}`);
+        if (el) {
+          el.innerHTML = `<img src="${p.thumbnailUrl}" loading="lazy" />`;
+        }
+      }
+    } catch(e) {
+      console.warn("Failed thumb for", p.entryName);
+    }
+  }
 }
 
 function initPreviewEvents() {
@@ -572,6 +664,7 @@ async function doGenerate() {
   const btn = qs('#generate-btn');
   const outputName = finalPdfName();
   const pages = selectedPageList();
+  
   if (!outputName) {
     toast('PDF name cannot be empty', 'error');
     qs('#pdf-name-input')?.focus();
@@ -585,30 +678,17 @@ async function doGenerate() {
   state.pdfName = stripExt(outputName, '.pdf');
   updatePdfNameInput();
   btn.disabled = true;
-  btn.textContent = 'Starting…';
+  
+  state.startTime   = Date.now();
+  state.totalImages = pages.length;
+  state.isGenerating = true;
+  goto('processing');
 
-  try {
-    const res = await fetch(`${API_BASE}/api/jobs/${state.jobId}/start`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ fileName: outputName, selected_pages: pages, page_size: state.pageSize }),
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.detail || 'Failed to start generation');
-    }
-    state.startTime   = Date.now();
-    state.totalImages = pages.length;
-    goto('processing');
-    startPolling();
-  } catch (e) {
-    toast(e.message, 'error');
-    btn.disabled = false;
-    btn.innerHTML = `Generate PDF ${icons.arrow}`;
-  }
+  // Let DOM update before heavy sync work
+  setTimeout(() => runPdfGenerationTask(outputName, pages), 100);
 }
 
-/* ── Step: Processing ────────────────────────────────────────────────────── */
+/* ── Step: Processing (jsPDF Offline Generation) ─────────────────────────── */
 function renderProcessing() {
   const zipNames = state.zips.map((z, i) =>
     `<span class="processing-zip-tag" id="ztag-${z.id}">${z.name}</span>`
@@ -618,7 +698,7 @@ function renderProcessing() {
     <div class="processing-wrap">
       <div class="section-heading" style="text-align:center">
         <h1>Forging your PDF…</h1>
-        <p class="sub" id="progress-msg">Preparing…</p>
+        <p class="sub" id="progress-msg">Preparing Offline Generation…</p>
       </div>
 
       <div class="progress-outer">
@@ -634,21 +714,171 @@ function renderProcessing() {
   `;
 }
 
-function updateProcessingUI(data) {
+function setProgress(pct, detailMsg) {
   const bar    = qs('#progress-bar');
-  const pct    = qs('#progress-pct');
+  const pctEl  = qs('#progress-pct');
   const detail = qs('#progress-detail');
   const msg    = qs('#progress-msg');
-  if (!bar) return;
 
-  const p = data.progress || 0;
-  bar.style.width = `${p}%`;
-  if (pct) pct.textContent = `${p}%`;
+  if (bar) bar.style.width = `${pct}%`;
+  if (pctEl) pctEl.textContent = `${pct}%`;
+  if (detail && detailMsg) detail.textContent = detailMsg;
+  if (msg && state.startTime) {
+    msg.textContent = `Running offline for ${fmtTime(Date.now() - state.startTime)}`;
+  }
+}
 
-  if (data.progressMsg && detail) detail.textContent = data.progressMsg;
-  if (msg) {
-    const elapsed = state.startTime ? fmtTime(Date.now() - state.startTime) : '';
-    msg.textContent = elapsed ? `Running for ${elapsed}` : 'Processing…';
+// Convert image Blob to HTMLImageElement wrapped in Promise
+function loadImage(blobUrl) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = (e) => reject(e);
+    img.src = blobUrl;
+  });
+}
+
+async function runPdfGenerationTask(outputName, selectedPageNumbers) {
+  try {
+    const { jsPDF } = window.jspdf;
+    
+    // We need to resolve which images to load
+    const pagesToProcess = state.pages.filter(p => selectedPageNumbers.includes(p.page));
+    
+    // 1) Analyze dimensions for Smart Auto
+    let smartW = 0, smartH = 0;
+    
+    if (state.pageSize === 'smart') {
+      setProgress(5, "Analyzing image dimensions...");
+      const dimCounts = {};
+      
+      for (let i = 0; i < pagesToProcess.length; i++) {
+        // Sample up to 50 images to find the most common ratio
+        if (i > 50) break;
+        const p = pagesToProcess[i];
+        try {
+          const img = await loadImage(p.thumbnailUrl);
+          const key = `${img.width}x${img.height}`;
+          dimCounts[key] = (dimCounts[key] || 0) + 1;
+        } catch(e) {}
+      }
+      
+      let bestKey = null;
+      let maxCount = 0;
+      for (const [key, count] of Object.entries(dimCounts)) {
+        if (count > maxCount) {
+          maxCount = count;
+          bestKey = key;
+        }
+      }
+      
+      if (bestKey) {
+        const [w, h] = bestKey.split('x').map(Number);
+        smartW = w;
+        smartH = h;
+      } else {
+        // Fallback A4 at 72dpi
+        smartW = 595.28;
+        smartH = 841.89;
+      }
+    }
+
+    // Initialize Document
+    // Default orientation portrait unless smart dimension is landscape
+    const defaultOrientation = (smartW > smartH) ? 'l' : 'p';
+    let doc = new jsPDF({
+      orientation: state.pageSize === 'smart' ? defaultOrientation : 'p',
+      unit: 'pt',
+      format: state.pageSize === 'a4' ? 'a4' : (state.pageSize === 'smart' ? [smartW, smartH] : 'a4')
+    });
+    // Remove default first page
+    doc.deletePage(1);
+
+    const A4_W = 595.28;
+    const A4_H = 841.89;
+
+    let processedCount = 0;
+    const total = pagesToProcess.length;
+
+    for (let i = 0; i < total; i++) {
+      const p = pagesToProcess[i];
+      setProgress(10 + Math.floor((i / total) * 80), `Processing page ${i+1} of ${total}`);
+      
+      try {
+        const img = await loadImage(p.thumbnailUrl);
+        const origW = img.width;
+        const origH = img.height;
+        
+        let targetW, targetH;
+        let pdfW, pdfH;
+        
+        if (state.pageSize === 'original') {
+          pdfW = origW;
+          pdfH = origH;
+          doc.addPage([pdfW, pdfH], pdfW > pdfH ? 'l' : 'p');
+          doc.addImage(img, 'JPEG', 0, 0, pdfW, pdfH, undefined, 'FAST');
+        } 
+        else if (state.pageSize === 'a4') {
+          pdfW = A4_W;
+          pdfH = A4_H;
+          doc.addPage('a4', 'p');
+          
+          // Fit into A4
+          const scale = Math.min(pdfW / origW, pdfH / origH);
+          targetW = origW * scale;
+          targetH = origH * scale;
+          const x = (pdfW - targetW) / 2;
+          const y = (pdfH - targetH) / 2;
+          
+          // White background
+          doc.setFillColor(255, 255, 255);
+          doc.rect(0, 0, pdfW, pdfH, 'F');
+          
+          doc.addImage(img, 'JPEG', x, y, targetW, targetH, undefined, 'FAST');
+        } 
+        else if (state.pageSize === 'smart') {
+          pdfW = smartW;
+          pdfH = smartH;
+          doc.addPage([pdfW, pdfH], pdfW > pdfH ? 'l' : 'p');
+          
+          // Fit into smart size
+          const scale = Math.min(pdfW / origW, pdfH / origH);
+          targetW = origW * scale;
+          targetH = origH * scale;
+          const x = (pdfW - targetW) / 2;
+          const y = (pdfH - targetH) / 2;
+          
+          doc.setFillColor(255, 255, 255);
+          doc.rect(0, 0, pdfW, pdfH, 'F');
+          doc.addImage(img, 'JPEG', x, y, targetW, targetH, undefined, 'FAST');
+        }
+        
+      } catch(e) {
+        console.error("Failed to add page", p.entryName, e);
+      }
+      processedCount++;
+    }
+
+    setProgress(95, "Finalizing PDF...");
+    
+    // Save to Blob and get size
+    const pdfBlob = doc.output('blob');
+    state.pdfSize = pdfBlob.size;
+    state.pdfBlobUrl = URL.createObjectURL(pdfBlob);
+    
+    state.isGenerating = false;
+    goto('complete');
+
+  } catch (e) {
+    console.error(e);
+    state.isGenerating = false;
+    const main = qs('#main-content');
+    main.innerHTML += `
+      <div class="error-box">
+        <h3>Generation failed</h3>
+        <p>${e.message || 'An unexpected error occurred during offline generation.'}</p>
+        <button class="btn btn-ghost" onclick="App.goto('review')">← Go back</button>
+      </div>`;
   }
 }
 
@@ -663,7 +893,7 @@ function renderComplete() {
 
       <div class="section-heading" style="text-align:center">
         <h1>PDF ready!</h1>
-        <p>Your images have been merged into a single PDF.</p>
+        <p>Your images have been successfully merged offline.</p>
       </div>
 
       <div class="complete-stats">
@@ -683,53 +913,20 @@ function renderComplete() {
 
       <div class="complete-actions">
         <button class="btn btn-success" id="dl-btn">${icons.dl} Download PDF</button>
-        <button class="btn btn-ghost"   id="again-btn">Start over</button>
+        <button class="btn btn-ghost"   id="again-btn">Start over (Clear Memory)</button>
       </div>
     </div>
   `;
 
   qs('#dl-btn').addEventListener('click', () => {
+    if (!state.pdfBlobUrl) return;
     const a = document.createElement('a');
-    a.href     = `${API_BASE}/api/jobs/${state.jobId}/download`;
+    a.href     = state.pdfBlobUrl;
     a.download = finalPdfName() || 'zipforge_output.pdf';
     a.click();
   });
 
-  qs('#again-btn').addEventListener('click', resetApp);
-}
-
-/* ── Polling ─────────────────────────────────────────────────────────────── */
-function startPolling() {
-  if (state.pollTimer) clearInterval(state.pollTimer);
-  state.pollTimer = setInterval(pollJob, POLL_MS);
-}
-
-async function pollJob() {
-  try {
-    const res = await fetch(`${API_BASE}/api/jobs/${state.jobId}`);
-    if (!res.ok) return;
-    const data = await res.json();
-
-    if (state.step === 'processing') updateProcessingUI(data);
-
-    if (data.status === 'complete') {
-      clearInterval(state.pollTimer);
-      state.totalImages = data.totalImages || state.totalImages;
-      state.pdfSize = data.pdfSize;
-      goto('complete');
-    }
-
-    if (data.status === 'error') {
-      clearInterval(state.pollTimer);
-      const main = qs('#main-content');
-      main.innerHTML += `
-        <div class="error-box">
-          <h3>Generation failed</h3>
-          <p>${data.error || 'An unexpected error occurred.'}</p>
-          <button class="btn btn-ghost" onclick="App.goto('review')">← Go back</button>
-        </div>`;
-    }
-  } catch { /* network blip — keep polling */ }
+  qs('#again-btn').addEventListener('click', clearCache);
 }
 
 /* ── Navigation ──────────────────────────────────────────────────────────── */
@@ -748,16 +945,7 @@ function goto(step) {
 }
 
 function resetApp() {
-  if (state.pollTimer) clearInterval(state.pollTimer);
-  if (state.jobId) {
-    fetch(`${API_BASE}/api/jobs/${state.jobId}`, { method: 'DELETE' }).catch(() => {});
-  }
-  Object.assign(state, {
-    step:'upload', jobId:null, zips:[], pages:[], selectedPages:new Set(), selected:[],
-    pollTimer:null, startTime:null, totalImages:0, pdfSize:0,
-    pdfName:'', pdfNameDirty:false, pageSize:'smart'
-  });
-  goto('upload');
+  clearCache();
 }
 
 /* ── Bootstrap ───────────────────────────────────────────────────────────── */
