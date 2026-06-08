@@ -176,8 +176,23 @@ function bufferToBase64Image(buffer, ext) {
 
 /* ── Memory Management & Cleanup ─────────────────────────────────────────── */
 async function cleanupJob(jobId) {
-  if (!Filesystem) return;
+  if (!Filesystem) return 0;
+  let freed = 0;
+  
+  async function calcSize(dir, p) {
+    let s = 0;
+    try {
+      const list = await Filesystem.readdir({ directory: dir, path: p });
+      for (const f of list.files) {
+        if (f.type === 'file') s += f.size || 0;
+        else if (f.type === 'directory') s += await calcSize(dir, `${p}/${f.name}`);
+      }
+    } catch(e) {}
+    return s;
+  }
+
   try {
+    freed += await calcSize(Directory.Cache, `zippdf/${jobId}`);
     await Filesystem.rmdir({
       directory: Directory.Cache,
       path: `zippdf/${jobId}`,
@@ -186,11 +201,19 @@ async function cleanupJob(jobId) {
   } catch (e) { console.warn('Cache cleanup:', e); }
 
   try {
+    const stateStat = await Filesystem.stat({
+      directory: Directory.Data,
+      path: `zippdf/${jobId}/state.json`
+    });
+    if(stateStat) freed += stateStat.size || 0;
+    
     await Filesystem.deleteFile({
       directory: Directory.Data,
       path: `zippdf/${jobId}/state.json`
     });
   } catch (e) { console.warn('State cleanup:', e); }
+  
+  return freed;
 }
 
 async function cleanupAbandonedJobs() {
@@ -349,18 +372,39 @@ document.addEventListener('DOMContentLoaded', () => {
   goto('upload');
 });
 
-function clearCache() {
+async function clearCache() {
+  let freed = 0;
   if (state.jobId) {
-    cleanupJob(state.jobId);
+    freed += await cleanupJob(state.jobId);
   }
+  
+  // Also clean up any abandoned jobs to free maximum space
+  if (Filesystem) {
+    try {
+      const list = await Filesystem.readdir({ directory: Directory.Cache, path: 'zippdf' });
+      for (const folder of list.files) {
+         if (folder.name !== state.jobId) {
+            freed += await cleanupJob(folder.name);
+         }
+      }
+    } catch(e) {}
+  }
+
   Object.assign(state, {
     zips: [], pages: [], selectedPages: new Set(), selected: [],
     startTime: null, totalImages: 0, pdfSize: 0,
     pdfName: '', pdfNameDirty: false, pageSize: 'smart',
     pdfPath: null, isGenerating: false, jobId: null
   });
+  
   goto('upload');
-  toast('Cache cleared and memory freed.', 'success');
+  
+  if (freed > 0) {
+    const mb = (freed / (1024 * 1024)).toFixed(2);
+    toast(`${mb} MB of cache data successfully cleared!`, 'success');
+  } else {
+    toast('Cache is already fully clean.', 'info');
+  }
 }
 
 /* ── SVG Icons ───────────────────────────────────────────────────────────── */
