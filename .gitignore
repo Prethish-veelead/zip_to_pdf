@@ -54,3 +54,10 @@ coverage/
 # Local app files
 *.sqlite
 *.sqlite3
+
+# Capacitor Build
+node_modules/
+android/
+
+node_modules/
+android/

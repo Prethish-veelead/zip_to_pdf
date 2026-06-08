@@ -2,8 +2,9 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ZipForge — ZIP to PDF</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="color-scheme" content="dark" />
+  <title>ZipForge - Local ZIP to PDF Converter</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=Outfit:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="style.css" />
@@ -15,25 +16,83 @@
         <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
           <polygon points="14,2 26,8 26,20 14,26 2,20 2,8" stroke="var(--accent)" stroke-width="1.5" fill="none"/>
           <polygon points="14,7 21,11 21,19 14,23 7,19 7,11" fill="var(--accent)" opacity="0.15"/>
-          <path d="M9 12h10M9 16h6" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round"/>
         </svg>
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
         <span class="logo-text">ZipForge</span>
       </div>
-      <nav id="step-nav" class="step-nav" aria-label="Progress steps"></nav>
-      <button id="clear-cache-btn" class="btn-clear-cache" title="Clear memory and reset app">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
-        Clear Cache
-      </button>
     </header>
 
     <main id="main-content" role="main"></main>
   </div>
 
+  <nav class="bottom-nav">
+    <button class="nav-item active" id="nav-zip-btn">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="12" y1="18" x2="12" y2="12"></line><line x1="9" y1="15" x2="15" y2="15"></line></svg>
+      Zip to PDF
+    </button>
+    <button class="nav-item" id="nav-history-btn">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+      Recent Files
+    </button>
+    <button class="nav-item" id="nav-settings-btn">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+      Settings
+    </button>
+  </nav>
+
   <div id="toast-container" aria-live="polite"></div>
+
+  <!-- Settings Modal -->
+  <div id="settings-modal" class="settings-modal">
+    <div class="settings-content">
+      <div class="settings-header">
+        <h2>Settings</h2>
+        <button id="close-settings-btn" class="btn-close">&times;</button>
+      </div>
+      
+      <div class="settings-group">
+        <h3>Theme</h3>
+        <div class="theme-options">
+          <button class="theme-btn" data-theme="dark">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+            Dark Mode
+          </button>
+          <button class="theme-btn" data-theme="light">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
+            Light Mode
+          </button>
+        </div>
+      </div>
+
+      <div class="settings-group">
+        <h3>Storage & Output</h3>
+        <label class="pdf-name-field" style="margin-bottom: 12px; display: block;" for="output-path-input">
+          <span style="font-size:12px; color:var(--text-2); margin-bottom:4px; display:block;">Output Folder (inside Documents)</span>
+          <input
+            id="output-path-input"
+            type="text"
+            value="ZipForge"
+            autocomplete="off"
+            spellcheck="false"
+            style="width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg-1); color: var(--text-1);"
+          />
+        </label>
+        <div class="storage-info-box" style="margin-top: 16px;">
+          <strong>Memory Safe Pipeline Active</strong><br><br>
+          ZipForge streams files directly to your device. You can find your PDFs in: <strong>Internal Storage > Documents > ZipForge</strong> (or your custom folder).
+          <br><br>
+          <button id="clear-cache-btn" class="btn btn-secondary" style="width: 100%; margin-top: 12px; border-color: var(--error); color: var(--error);">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:8px;"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+            Clear Temporary Data
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <!-- Local Offline Dependencies -->
   <script src="libs/jszip.min.js"></script>
-  <script src="libs/jspdf.umd.min.js"></script>
+  <script src="libs/pdf-lib.min.js"></script>
   <script src="libs/Sortable.min.js"></script>
   <script src="app.js"></script>
 </body>

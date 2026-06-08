@@ -1,0 +1,32 @@
+{
+  "name": "zip_to_pdf",
+  "version": "1.0.0",
+  "description": "learing and thinking possible ways",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Prethish-veelead/zip_to_pdf.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/Prethish-veelead/zip_to_pdf/issues"
+  },
+  "homepage": "https://github.com/Prethish-veelead/zip_to_pdf#readme",
+  "dependencies": {
+    "@capacitor-community/file-opener": "^8.0.1",
+    "@capacitor/android": "^8.4.0",
+    "@capacitor/core": "^8.4.0",
+    "@capacitor/filesystem": "^8.1.2",
+    "@capacitor/share": "^8.0.1"
+  },
+  "devDependencies": {
+    "@capacitor/assets": "^3.0.5",
+    "@capacitor/cli": "^8.4.0"
+  }
+}

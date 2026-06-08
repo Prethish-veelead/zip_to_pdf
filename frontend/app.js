@@ -4,21 +4,30 @@ const MAX_FILES    = 30;
 const MAX_PDF_NAME_LEN = 100;
 const INVALID_FILENAME_CHARS = /[\\/:*?"<>|]/g;
 
-/* ── State ───────────────────────────────────────────────────────────────── */
+/* ── Capacitor & Plugins ─────────────────────────────────────────────────── */
+const { Capacitor } = window;
+const { Filesystem, Share, FileOpener } = Capacitor?.Plugins || {};
+const Directory = { Cache: 'CACHE', Data: 'DATA', External: 'EXTERNAL', Documents: 'DOCUMENTS' };
+const JSZip = window.JSZip;
+const { PDFDocument, rgb } = window.PDFLib || {};
+
+/* ── Global State (UI sync) ─────────────────────────────────────────────── */
 const state = {
   step:       'upload',
-  zips:       [],         // [{id, name, size, imageCount, order, fileObj, validImages: []}]
-  pages:      [],         // [{page, zipId, zipName, imageName, entryName, thumbnailUrl}]
+  zips:       [],         
+  pages:      [],         
   selectedPages:new Set(),
-  selected:   [],         // File objects chosen but not yet uploaded
+  selected:   [],         
   startTime:  null,
   totalImages:0,
   pdfSize:    0,
   pdfName:    '',
   pdfNameDirty:false,
   pageSize:   'smart',
-  pdfBlobUrl: null,       // URL for the generated PDF to download
-  isGenerating: false
+  pdfPath:    null,
+  isGenerating: false,
+  jobId:      null,
+  outputFolder: localStorage.getItem('zipforge_output_folder') || 'ZipForge'
 };
 
 /* ── Utilities ───────────────────────────────────────────────────────────── */
@@ -54,6 +63,15 @@ function sanitizePdfBase(value) {
     .slice(0, MAX_PDF_NAME_LEN - 4);
 }
 
+function sanitizePdfName(raw) {
+  let name = raw.replace(INVALID_FILENAME_CHARS, '');
+  name = name.trim();
+  if (!name) name = 'ZipForge_Output';
+  if (name.length > 100) name = name.slice(0, 100);
+  if (!name.toLowerCase().endsWith('.pdf')) name += '.pdf';
+  return name;
+}
+
 function finalPdfName(value = state.pdfName) {
   const base = sanitizePdfBase(value).trim().replace(/[. ]+$/g, '');
   if (!base) return '';
@@ -87,36 +105,260 @@ function toast(msg, type = 'info', dur = 4000) {
   setTimeout(() => el.remove(), dur);
 }
 
-/* ── Memory Management (Clear Cache) ─────────────────────────────────────── */
-function clearCache() {
-  // Revoke all object URLs to free memory
-  if (state.pdfBlobUrl) {
-    URL.revokeObjectURL(state.pdfBlobUrl);
-    state.pdfBlobUrl = null;
+/* ── Device Handlers ─────────────────────────────────────────────────────── */
+function isLowRamDevice() {
+  return (navigator.deviceMemory && navigator.deviceMemory <= 4);
+}
+
+/* ── Storage Pipeline Helpers ────────────────────────────────────────────── */
+function base64ToUint8Array(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function uint8ArrayToBase64(uint8Array) {
+  let binary = '';
+  const chunkSize = 8192;
+  for (let i = 0; i < uint8Array.length; i += chunkSize) {
+    binary += String.fromCharCode(...uint8Array.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function generateJobId() {
+  return 'job_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+}
+
+async function readState(jobId) {
+  if (!Filesystem) return null;
+  const result = await Filesystem.readFile({
+    directory: Directory.Data,
+    path: `zippdf/${jobId}/state.json`,
+    encoding: 'utf8'
+  });
+  return JSON.parse(result.data);
+}
+
+async function writeState(jobId, stateObj) {
+  if (!Filesystem) return;
+  await Filesystem.writeFile({
+    directory: Directory.Data,
+    path: `zippdf/${jobId}/state.json`,
+    data: JSON.stringify(stateObj),
+    encoding: 'utf8',
+    recursive: true
+  });
+}
+
+async function updateState(jobId, fields) {
+  if (!Filesystem) return;
+  const s = await readState(jobId);
+  if (s) {
+    Object.assign(s, fields);
+    await writeState(jobId, s);
+  }
+}
+
+// Convert image buffer to base64, preserving format
+function bufferToBase64Image(buffer, ext) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+/* ── Memory Management & Cleanup ─────────────────────────────────────────── */
+async function cleanupJob(jobId) {
+  if (!Filesystem) return;
+  try {
+    await Filesystem.rmdir({
+      directory: Directory.Cache,
+      path: `zippdf/${jobId}`,
+      recursive: true
+    });
+  } catch (e) { console.warn('Cache cleanup:', e); }
+
+  try {
+    await Filesystem.deleteFile({
+      directory: Directory.Data,
+      path: `zippdf/${jobId}/state.json`
+    });
+  } catch (e) { console.warn('State cleanup:', e); }
+}
+
+async function cleanupAbandonedJobs() {
+  if (!Filesystem) return;
+  try {
+    const list = await Filesystem.readdir({
+      directory: Directory.Cache,
+      path: 'zippdf'
+    });
+    const oneDayAgo = Date.now() - (24 * 60 * 60 * 1000);
+    for (const folder of list.files) {
+      const folderName = folder.name;
+      const stateResult = await Filesystem.readFile({
+        directory: Directory.Data,
+        path: `zippdf/${folderName}/state.json`
+      }).catch(() => null);
+      if (!stateResult) {
+        await Filesystem.rmdir({
+          directory: Directory.Cache,
+          path: `zippdf/${folderName}`,
+          recursive: true
+        }).catch(() => {});
+        continue;
+      }
+      const s = JSON.parse(stateResult.data);
+      if (new Date(s.createdAt).getTime() < oneDayAgo) {
+        await cleanupJob(folderName);
+      }
+    }
+  } catch (e) { /* no jobs folder yet */ }
+}
+
+async function cleanupOldPDFs() {
+  if (!Filesystem) return;
+  const cleanFolder = state.outputFolder.trim() || 'ZipForge';
+  const now = Date.now();
+  const ONE_DAY = 24 * 60 * 60 * 1000;
+
+  // 1. Cleanup PDFs older than 24h in the output folder
+  try {
+    const res = await Filesystem.readdir({
+      directory: Directory.Documents,
+      path: cleanFolder
+    });
+    for (const f of res.files) {
+      if (f.name.endsWith('.pdf') && f.mtime > 0 && (now - f.mtime > ONE_DAY)) {
+        await Filesystem.deleteFile({
+          directory: Directory.Documents,
+          path: `${cleanFolder}/${f.name}`
+        }).catch(()=>{});
+      }
+    }
+  } catch (e) {}
+
+  // 2. Cleanup legacy 'job_' folders that were incorrectly created in Documents root
+  try {
+    const rootRes = await Filesystem.readdir({
+      directory: Directory.Documents,
+      path: ''
+    });
+    for (const f of rootRes.files) {
+      if (f.type === 'directory' && f.name.startsWith('job_')) {
+        await Filesystem.rmdir({
+          directory: Directory.Documents,
+          path: f.name,
+          recursive: true
+        }).catch(()=>{});
+      }
+    }
+  } catch(e) {}
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  if (Capacitor && Capacitor.isNativePlatform()) {
+    cleanupAbandonedJobs();
+    cleanupOldPDFs();
   }
   
-  for (const page of state.pages) {
-    if (page.thumbnailUrl) {
-      URL.revokeObjectURL(page.thumbnailUrl);
-      page.thumbnailUrl = null;
-    }
+  const pathInput = qs('#output-path-input');
+  if (pathInput) {
+    pathInput.value = state.outputFolder;
+    pathInput.addEventListener('input', e => {
+      let val = e.target.value.replace(/[\\:*?"<>|]/g, '').trim();
+      if (!val) val = 'ZipForge';
+      state.outputFolder = val;
+      localStorage.setItem('zipforge_output_folder', val);
+    });
   }
 
-  for (const zip of state.zips) {
-    if (zip.thumbnailUrl) {
-      URL.revokeObjectURL(zip.thumbnailUrl);
-      zip.thumbnailUrl = null;
-    }
+  // Bottom Navigation Listeners
+  const navZipBtn = qs('#nav-zip-btn');
+  const navHistoryBtn = qs('#nav-history-btn');
+  const navSettingsBtn = qs('#nav-settings-btn');
+  
+  if (navZipBtn) navZipBtn.addEventListener('click', () => {
+    document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+    navZipBtn.classList.add('active');
+    goto('upload');
+  });
+  if (navHistoryBtn) navHistoryBtn.addEventListener('click', () => {
+    document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+    navHistoryBtn.classList.add('active');
+    goto('history');
+  });
+  
+  // Settings Modal Listeners
+  const settingsModal = qs('#settings-modal');
+  const closeSettingsBtn = qs('#close-settings-btn');
+  if (navSettingsBtn && settingsModal) {
+    navSettingsBtn.addEventListener('click', () => {
+      settingsModal.classList.add('active');
+      document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+      navSettingsBtn.classList.add('active');
+    });
+    closeSettingsBtn.addEventListener('click', () => {
+      settingsModal.classList.remove('active');
+      // restore active state to whatever screen is actually visible
+      document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+      if (qs('#history-list')) navHistoryBtn.classList.add('active');
+      else navZipBtn.classList.add('active');
+    });
+  }
+  
+  // Clear Cache
+  const clearCacheBtn = qs('#clear-cache-btn');
+  if (clearCacheBtn) {
+    clearCacheBtn.addEventListener('click', () => {
+      clearCache();
+      toast('Temporary data cleared', 'success');
+    });
   }
 
-  // Reset state
+  // Theme Toggle Listeners
+  const themeBtns = document.querySelectorAll('.theme-btn');
+  themeBtns.forEach(btn => {
+    btn.addEventListener('click', () => {
+      const theme = btn.dataset.theme;
+      document.documentElement.setAttribute('data-theme', theme);
+      localStorage.setItem('zipforge_theme', theme);
+
+      // Update active state
+      themeBtns.forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+    });
+  });
+  const savedTheme = localStorage.getItem('zipforge_theme');
+  if (savedTheme) {
+    document.documentElement.setAttribute('data-theme', savedTheme);
+    const activeBtn = Array.from(themeBtns).find(b => b.dataset.theme === savedTheme);
+    if (activeBtn) activeBtn.classList.add('active');
+  } else {
+    const darkBtn = Array.from(themeBtns).find(b => b.dataset.theme === 'dark');
+    if (darkBtn) darkBtn.classList.add('active');
+  }
+  
+  goto('upload');
+});
+
+function clearCache() {
+  if (state.jobId) {
+    cleanupJob(state.jobId);
+  }
   Object.assign(state, {
     zips: [], pages: [], selectedPages: new Set(), selected: [],
     startTime: null, totalImages: 0, pdfSize: 0,
     pdfName: '', pdfNameDirty: false, pageSize: 'smart',
-    isGenerating: false
+    pdfPath: null, isGenerating: false, jobId: null
   });
-
   goto('upload');
   toast('Cache cleared and memory freed.', 'success');
 }
@@ -127,6 +369,7 @@ const icons = {
   file:   `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>`,
   check:  `<svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`,
   dl:     `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`,
+  eye:    `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>`,
   arrow:  `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>`,
   back:   `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>`,
   image:  `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>`,
@@ -149,10 +392,9 @@ const STEPS = [
   { key: 'complete',   label: 'Done'     },
 ];
 
-function renderStepNav() {
+function getStepNavHtml() {
   const cur = STEPS.findIndex(s => s.key === state.step);
-  const nav = qs('#step-nav');
-  nav.innerHTML = STEPS.map((s, i) => {
+  const stepsHtml = STEPS.map((s, i) => {
     const cls = i < cur ? 'done' : i === cur ? 'active' : '';
     const dot  = i < cur ? '✓' : i + 1;
     const line = i < STEPS.length - 1
@@ -164,6 +406,18 @@ function renderStepNav() {
         <span class="step-label">${s.label}</span>
       </div>${line}`;
   }).join('');
+  return `<nav id="step-nav" class="step-nav" aria-label="Progress steps">${stepsHtml}</nav>`;
+}
+
+/* ── Navigation ──────────────────────────────────────────────────────────── */
+function goto(stepKey) {
+  state.step = stepKey;
+  if (stepKey === 'upload') renderUpload();
+  else if (stepKey === 'review') renderReview();
+  else if (stepKey === 'preview') renderPreview();
+  else if (stepKey === 'processing') renderProcessing();
+  else if (stepKey === 'complete') renderComplete();
+  else if (stepKey === 'history') renderHistory();
 }
 
 /* ── JSZip Helpers ───────────────────────────────────────────────────────── */
@@ -175,22 +429,107 @@ function isValidImage(filename) {
   return ext && VALID_EXT.includes(ext[0]);
 }
 
-async function createThumbnailBlob(zipFileObj, entryName) {
-  try {
-    const zip = await JSZip.loadAsync(zipFileObj);
-    const file = zip.file(entryName);
-    if (!file) return null;
+async function getImageDimensionsFromBuffer(buffer, mime) {
+  return new Promise((resolve) => {
+    const blob = new Blob([buffer], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => {
+      resolve({ width: img.width, height: img.height });
+      URL.revokeObjectURL(url);
+    };
+    img.onerror = () => {
+      resolve({ width: 0, height: 0 });
+      URL.revokeObjectURL(url);
+    };
+    img.src = url;
+  });
+}
+
+// Memory-safe extraction to storage
+async function extractZipToStorage(jobId, zips) {
+  let globalIdx = 1;
+  const stateData = {
+    jobId: jobId,
+    status: 'extracting',
+    progress: 0,
+    totalImages: state.totalImages,
+    processedImages: 0,
+    pdfName: '',
+    pageMode: 'smart',
+    pdfPath: null,
+    createdAt: new Date().toISOString(),
+    completedAt: null,
+    zipFiles: [],
+    pages: []
+  };
+
+  await writeState(jobId, stateData);
+
+  for (const z of zips) {
+    const zip = await JSZip.loadAsync(z.fileObj);
     
-    // Get array buffer, make blob
-    const buffer = await file.async("arraybuffer");
-    let ext = entryName.split('.').pop().toLowerCase();
-    if (ext === 'jpg') ext = 'jpeg';
-    const blob = new Blob([buffer], { type: `image/${ext}` });
-    return URL.createObjectURL(blob);
-  } catch (e) {
-    console.error("Thumbnail error:", e);
-    return null;
+    for (const entryName of z.validImages) {
+      const file = zip.file(entryName);
+      if (!file) continue;
+
+      const buffer = await file.async("arraybuffer");
+      let ext = entryName.split('.').pop().toLowerCase();
+      if (ext === 'jpg') ext = 'jpeg';
+      const mime = `image/${ext}`;
+      
+      const dims = await getImageDimensionsFromBuffer(buffer, mime);
+
+      // Write full image
+      const base64Data = bufferToBase64Image(buffer, ext);
+      await Filesystem.writeFile({
+        directory: Directory.Cache,
+        path: `zippdf/${jobId}/imgs/${globalIdx}.${ext}`,
+        data: base64Data,
+        recursive: true
+      });
+
+      // Write same image as thumbnail
+      await Filesystem.writeFile({
+        directory: Directory.Cache,
+        path: `zippdf/${jobId}/thumbs/${globalIdx}.${ext}`,
+        data: base64Data,
+        recursive: true
+      });
+
+      stateData.pages.push({
+        index: globalIdx,
+        fileName: entryName.split('/').pop(),
+        zipName: z.name,
+        width: dims.width,
+        height: dims.height,
+        included: true,
+        ext: ext
+      });
+
+      state.pages.push({
+        page: globalIdx,
+        zipId: z.id,
+        zipName: z.name,
+        imageName: entryName.split('/').pop(),
+        entryName: entryName,
+        thumbnailUrl: null,
+        ext: ext
+      });
+
+      globalIdx++;
+      
+      if (globalIdx % 20 === 0) {
+        stateData.processedImages = globalIdx;
+        stateData.progress = Math.floor((globalIdx / state.totalImages) * 50); // 50% for extraction
+        await writeState(jobId, stateData);
+      }
+    }
   }
+
+  stateData.progress = 50;
+  await writeState(jobId, stateData);
+  state.selectedPages = new Set(state.pages.map(p => p.page));
 }
 
 /* ── Step: Upload ────────────────────────────────────────────────────────── */
@@ -201,6 +540,7 @@ function renderUpload() {
       <h1>Convert ZIPs to PDF</h1>
       <p>Upload your ZIP files — we'll stack all images into one clean PDF offline.</p>
     </div>
+    ${getStepNavHtml()}
 
     <div class="upload-zone" id="drop-zone" role="button" tabindex="0" aria-label="Upload ZIP files">
       <div class="upload-icon">${icons.upload}</div>
@@ -300,9 +640,7 @@ async function doUpload() {
     for (let i = 0; i < state.selected.length; i++) {
       const f = state.selected[i];
       const zip = await JSZip.loadAsync(f);
-      const validImages = Object.keys(zip.files)
-        .filter(isValidImage)
-        .sort(); // sort by name alphabetically
+      const validImages = Object.keys(zip.files).filter(isValidImage).sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
 
       state.zips.push({
         id: i,
@@ -311,8 +649,7 @@ async function doUpload() {
         imageCount: validImages.length,
         order: i,
         fileObj: f,
-        validImages: validImages,
-        thumbnailUrl: null
+        validImages: validImages
       });
     }
 
@@ -340,6 +677,7 @@ function renderReview() {
       <h1>Review ZIP order</h1>
       <p>Drag to arrange ZIPs in the correct sequence before generating.</p>
     </div>
+    ${getStepNavHtml()}
 
     <div class="summary-bar">
       <span class="tag">${state.zips.length} ZIPs</span>
@@ -372,13 +710,38 @@ function renderReview() {
       <button class="btn btn-ghost" id="back-btn">${icons.back} Back</button>
       <span class="spacer"></span>
       <button class="btn btn-primary" id="generate-btn">
-        Preview Pages ${icons.arrow}
+        Extract & Preview ${icons.arrow}
       </button>
     </div>
   `;
 
   initSortable();
-  lazyLoadZipThumbnails();
+
+  // Load zip thumbnails async
+  state.zips.forEach(z => {
+    if (!z.fileObj) return;
+    JSZip.loadAsync(z.fileObj).then(async zip => {
+      const validImages = Object.keys(zip.files).filter(isValidImage).sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+      if (validImages.length > 0) {
+        const file = zip.file(validImages[0]);
+        const buffer = await file.async('arraybuffer');
+        let ext = validImages[0].split('.').pop().toLowerCase();
+        if (ext === 'jpg') ext = 'jpeg';
+        const b64 = uint8ArrayToBase64(new Uint8Array(buffer));
+
+        const img = document.createElement('img');
+        img.src = `data:image/${ext};base64,` + b64;
+        img.style.width = '100%';
+        img.style.height = '100%';
+        img.style.objectFit = 'cover';
+        const thumbEl = qs(`#zip-thumb-${z.id}`);
+        if (thumbEl) {
+          thumbEl.innerHTML = '';
+          thumbEl.appendChild(img);
+        }
+      }
+    }).catch(err => console.error("Thumbnail load error:", err));
+  });
 
   qs('#pdf-name-input').addEventListener('input', e => {
     const cleaned = sanitizePdfBase(e.target.value);
@@ -393,14 +756,14 @@ function renderReview() {
   });
 
   qs('#back-btn').addEventListener('click', clearCache);
-  qs('#generate-btn').addEventListener('click', doPreview);
+  qs('#generate-btn').addEventListener('click', doExtraction);
 }
 
 function zipCardHtml(z) {
   return `
     <div class="zip-card" data-id="${z.id}">
       <div class="zip-order">${z.order + 1}</div>
-      <div class="zip-thumb" id="thumb-${z.id}">
+      <div class="zip-thumb" id="zip-thumb-${z.id}">
         <span class="thumb-placeholder">${icons.image}</span>
       </div>
       <div class="zip-info">
@@ -414,93 +777,53 @@ function zipCardHtml(z) {
     </div>`;
 }
 
-async function lazyLoadZipThumbnails() {
-  for (const z of state.zips) {
-    if (z.imageCount === 0) continue;
-    
-    // Check if we already created one
-    if (!z.thumbnailUrl) {
-      const firstEntry = z.validImages[0];
-      z.thumbnailUrl = await createThumbnailBlob(z.fileObj, firstEntry);
-    }
-    
-    const el = qs(`#thumb-${z.id}`);
-    if (el && z.thumbnailUrl) {
-      const img = new Image();
-      img.src = z.thumbnailUrl;
-      img.onload = () => { el.innerHTML = ''; el.appendChild(img); };
-    }
-  }
-}
-
 function initSortable() {
   const list = qs('#zip-list');
   new Sortable(list, {
-    handle:              '.drag-handle',
-    animation:           180,
-    delay:               120,
-    delayOnTouchOnly:    true,
-    touchStartThreshold: 5,
-    ghostClass:          'sortable-ghost',
-    chosenClass:         'sortable-chosen',
+    handle: '.drag-handle',
+    animation: 180,
     onEnd() {
-      // Read new DOM order and sync state
       const newOrder = qsa('#zip-list .zip-card').map(c => +c.dataset.id);
       state.zips.sort((a,b) => newOrder.indexOf(a.id) - newOrder.indexOf(b.id));
       state.zips.forEach((z, i) => { z.order = i; });
-      state.pages = [];
-      state.selectedPages = new Set();
-
-      // Update visual order badges
       qsa('#zip-list .zip-order').forEach((el, i) => { el.textContent = i + 1; });
-
       syncDefaultPdfName();
       updatePdfNameInput();
     }
   });
 }
 
-async function doPreview() {
+async function doExtraction() {
   const btn = qs('#generate-btn');
   const outputName = finalPdfName();
   if (!outputName) {
     toast('PDF name cannot be empty', 'error');
-    qs('#pdf-name-input')?.focus();
+    return;
+  }
+
+  if (!Capacitor || !Capacitor.isNativePlatform()) {
+    toast('This app must be run as an Android APK to use local processing.', 'error');
     return;
   }
 
   state.pdfName = stripExt(outputName, '.pdf');
   updatePdfNameInput();
   btn.disabled = true;
-  btn.textContent = 'Extracting Previews...';
+  btn.textContent = 'Extracting to Storage...';
 
   try {
-    // Generate page objects across all ordered zips
-    state.pages = [];
-    let globalIdx = 1;
-    
-    // Sort zips by order just in case
+    state.jobId = generateJobId();
+    state.totalImages = state.zips.reduce((a, z) => a + z.imageCount, 0);
     const sortedZips = [...state.zips].sort((a,b) => a.order - b.order);
+    
+    await extractZipToStorage(state.jobId, sortedZips);
 
-    for (const z of sortedZips) {
-      for (const entryName of z.validImages) {
-        state.pages.push({
-          page: globalIdx++,
-          zipId: z.id,
-          zipName: z.name,
-          imageName: entryName.split('/').pop(),
-          entryName: entryName,
-          thumbnailUrl: null // will be lazy loaded
-        });
-      }
-    }
-
-    state.selectedPages = new Set(state.pages.map(p => p.page));
     goto('preview');
   } catch (e) {
-    toast('Failed to prepare preview', 'error');
+    console.error(e);
+    toast('Failed to extract to persistent storage', 'error');
     btn.disabled = false;
-    btn.innerHTML = `Preview Pages ${icons.arrow}`;
+    btn.innerHTML = `Extract & Preview ${icons.arrow}`;
   }
 }
 
@@ -514,6 +837,7 @@ function renderPreview() {
       <h1>Preview pages</h1>
       <p>Check thumbnails and choose which images should be included.</p>
     </div>
+    ${getStepNavHtml()}
 
     <div class="page-size-selector">
       <h3>Page Size</h3>
@@ -547,11 +871,6 @@ function renderPreview() {
         <span class="tag" id="selected-count">${selected.toLocaleString()} selected</span>
         <span class="preview-total">${total.toLocaleString()} pages</span>
       </div>
-      <div class="bulk-actions">
-        <button class="btn btn-ghost" id="select-all-btn">Select All</button>
-        <button class="btn btn-ghost" id="deselect-all-btn">Deselect All</button>
-        <button class="btn btn-ghost" id="invert-btn">Invert Selection</button>
-      </div>
     </div>
 
     <div class="preview-grid" id="preview-grid">
@@ -568,7 +887,7 @@ function renderPreview() {
   `;
 
   initPreviewEvents();
-  lazyLoadAllPageThumbnails();
+  lazyLoadStorageThumbnails();
 }
 
 function pageCardHtml(p) {
@@ -580,69 +899,36 @@ function pageCardHtml(p) {
         <input class="page-check" type="checkbox" data-page="${p.page}" ${checked} />
       </div>
       <div class="page-thumb" id="page-thumb-${p.page}">
-        ${p.thumbnailUrl ? `<img src="${p.thumbnailUrl}" loading="lazy" />` : `<span class="thumb-placeholder">${icons.image}</span>`}
+        <span class="thumb-placeholder">${icons.image}</span>
       </div>
       <div class="page-name" title="${escapeAttr(p.entryName)}">${escapeHtml(p.imageName)}</div>
-      <div class="page-zip" title="${escapeAttr(p.zipName)}">${escapeHtml(p.zipName)}</div>
     </label>`;
 }
 
-async function lazyLoadAllPageThumbnails() {
-  // Use a map to cache zip instances for this loop so we don't reload async 100 times
-  const zipCache = {};
+async function lazyLoadStorageThumbnails() {
   for (const p of state.pages) {
-    if (p.thumbnailUrl) continue; // already loaded
-
-    const zipState = state.zips.find(z => z.id === p.zipId);
-    if (!zipCache[p.zipId]) {
-      zipCache[p.zipId] = await JSZip.loadAsync(zipState.fileObj);
+    if (!p.thumbnailUrl) {
+      try {
+        const path = `zippdf/${state.jobId}/thumbs/${p.page}.${p.ext || 'jpg'}`;
+        const result = await Filesystem.getUri({ directory: Directory.Cache, path: path });
+        p.thumbnailUrl = Capacitor.convertFileSrc(result.uri);
+      } catch(e) {}
     }
-    const zip = zipCache[p.zipId];
-    
-    try {
-      const file = zip.file(p.entryName);
-      if (file) {
-        const buffer = await file.async("arraybuffer");
-        let ext = p.entryName.split('.').pop().toLowerCase();
-        if (ext === 'jpg') ext = 'jpeg';
-        const blob = new Blob([buffer], { type: `image/${ext}` });
-        p.thumbnailUrl = URL.createObjectURL(blob);
-
-        const el = qs(`#page-thumb-${p.page}`);
-        if (el) {
-          el.innerHTML = `<img src="${p.thumbnailUrl}" loading="lazy" />`;
-        }
-      }
-    } catch(e) {
-      console.warn("Failed thumb for", p.entryName);
+    const el = qs(`#page-thumb-${p.page}`);
+    if (el && p.thumbnailUrl) {
+      el.innerHTML = `<img src="${p.thumbnailUrl}" loading="lazy" />`;
     }
   }
 }
 
 function initPreviewEvents() {
-  qs('#preview-back-btn').addEventListener('click', () => goto('review'));
+  qs('#preview-back-btn').addEventListener('click', clearCache);
   qs('#generate-btn').addEventListener('click', doGenerate);
   
   qsa('input[name="page-size"]').forEach(el => {
     el.addEventListener('change', e => {
       if (e.target.checked) state.pageSize = e.target.value;
     });
-  });
-  qs('#select-all-btn').addEventListener('click', () => {
-    state.selectedPages = new Set(state.pages.map(p => p.page));
-    renderPreview();
-  });
-  qs('#deselect-all-btn').addEventListener('click', () => {
-    state.selectedPages = new Set();
-    renderPreview();
-  });
-  qs('#invert-btn').addEventListener('click', () => {
-    const next = new Set();
-    state.pages.forEach(p => {
-      if (!state.selectedPages.has(p.page)) next.add(p.page);
-    });
-    state.selectedPages = next;
-    renderPreview();
   });
 
   qs('#preview-grid').addEventListener('change', e => {
@@ -651,55 +937,46 @@ function initPreviewEvents() {
     if (e.target.checked) state.selectedPages.add(page);
     else state.selectedPages.delete(page);
     e.target.closest('.page-card')?.classList.toggle('selected', e.target.checked);
-    updatePreviewSummary();
+    qs('#selected-count').textContent = `${state.selectedPages.size.toLocaleString()} selected`;
   });
-}
-
-function updatePreviewSummary() {
-  const count = qs('#selected-count');
-  if (count) count.textContent = `${state.selectedPages.size.toLocaleString()} selected`;
 }
 
 async function doGenerate() {
   const btn = qs('#generate-btn');
-  const outputName = finalPdfName();
   const pages = selectedPageList();
   
-  if (!outputName) {
-    toast('PDF name cannot be empty', 'error');
-    qs('#pdf-name-input')?.focus();
-    return;
-  }
   if (!pages.length) {
     toast('Select at least one page', 'error');
     return;
   }
 
-  state.pdfName = stripExt(outputName, '.pdf');
-  updatePdfNameInput();
-  btn.disabled = true;
-  
-  state.startTime   = Date.now();
-  state.totalImages = pages.length;
-  state.isGenerating = true;
-  goto('processing');
+  // Check RAM flag for large jobs
+  if (pages.length > 800 && isLowRamDevice()) {
+    toast('Large job — may be slow on older devices. Please wait.', 'info');
+  }
 
-  // Let DOM update before heavy sync work
-  setTimeout(() => runPdfGenerationTask(outputName, pages), 100);
+  btn.disabled = true;
+  state.startTime = Date.now();
+  state.isGenerating = true;
+  
+  updateState(state.jobId, {
+    pageMode: state.pageSize,
+    pdfName: state.pdfName
+  });
+
+  goto('processing');
+  setTimeout(() => runPdfGenerationTask(pages), 100);
 }
 
-/* ── Step: Processing (jsPDF Offline Generation) ─────────────────────────── */
+/* ── Step: Processing (pdf-lib Offline Generation) ───────────────────────── */
 function renderProcessing() {
-  const zipNames = state.zips.map((z, i) =>
-    `<span class="processing-zip-tag" id="ztag-${z.id}">${z.name}</span>`
-  ).join('');
-
   qs('#main-content').innerHTML = `
     <div class="processing-wrap">
       <div class="section-heading" style="text-align:center">
         <h1>Forging your PDF…</h1>
-        <p class="sub" id="progress-msg">Preparing Offline Generation…</p>
+        <p class="sub" id="progress-msg">Processing entirely offline</p>
       </div>
+      ${getStepNavHtml()}
 
       <div class="progress-outer">
         <div class="progress-bar" id="progress-bar" style="width:0%"></div>
@@ -708,8 +985,6 @@ function renderProcessing() {
         <span id="progress-detail">Starting up</span>
         <span class="progress-pct" id="progress-pct">0%</span>
       </div>
-
-      <div class="processing-zips">${zipNames}</div>
     </div>
   `;
 }
@@ -718,236 +993,388 @@ function setProgress(pct, detailMsg) {
   const bar    = qs('#progress-bar');
   const pctEl  = qs('#progress-pct');
   const detail = qs('#progress-detail');
-  const msg    = qs('#progress-msg');
 
   if (bar) bar.style.width = `${pct}%`;
   if (pctEl) pctEl.textContent = `${pct}%`;
   if (detail && detailMsg) detail.textContent = detailMsg;
-  if (msg && state.startTime) {
-    msg.textContent = `Running offline for ${fmtTime(Date.now() - state.startTime)}`;
-  }
 }
 
-// Convert image Blob to HTMLImageElement wrapped in Promise
-function loadImage(blobUrl) {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = (e) => reject(e);
-    img.src = blobUrl;
-  });
-}
-
-async function runPdfGenerationTask(outputName, selectedPageNumbers) {
+async function runPdfGenerationTask(selectedPageNumbers) {
   try {
-    const { jsPDF } = window.jspdf;
+    const s = await readState(state.jobId);
+    const pagesToProcess = s.pages.filter(p => selectedPageNumbers.includes(p.index));
     
-    // We need to resolve which images to load
-    const pagesToProcess = state.pages.filter(p => selectedPageNumbers.includes(p.page));
-    
-    // 1) Analyze dimensions for Smart Auto
-    let smartW = 0, smartH = 0;
-    
+    // Smart Auto Logic
+    let smartW = 595.28, smartH = 841.89;
     if (state.pageSize === 'smart') {
-      setProgress(5, "Analyzing image dimensions...");
-      const dimCounts = {};
+      let counts = { p: 0, l: 0, s: 0 };
+      pagesToProcess.forEach(p => {
+        if (p.width < p.height) counts.p++;
+        else if (p.width > p.height) counts.l++;
+        else counts.s++;
+      });
       
-      for (let i = 0; i < pagesToProcess.length; i++) {
-        // Sample up to 50 images to find the most common ratio
-        if (i > 50) break;
-        const p = pagesToProcess[i];
-        try {
-          const img = await loadImage(p.thumbnailUrl);
-          const key = `${img.width}x${img.height}`;
-          dimCounts[key] = (dimCounts[key] || 0) + 1;
-        } catch(e) {}
-      }
-      
-      let bestKey = null;
-      let maxCount = 0;
-      for (const [key, count] of Object.entries(dimCounts)) {
-        if (count > maxCount) {
-          maxCount = count;
-          bestKey = key;
+      const primary = Object.keys(counts).reduce((a, b) => counts[a] > counts[b] ? a : b);
+      const filtered = pagesToProcess.filter(p => {
+        if (primary === 'p') return p.width < p.height;
+        if (primary === 'l') return p.width > p.height;
+        return p.width === p.height;
+      });
+
+      if (filtered.length > 0) {
+        filtered.sort((a,b) => a.width - b.width);
+        const medW = filtered[Math.floor(filtered.length/2)].width;
+        filtered.sort((a,b) => a.height - b.height);
+        const medH = filtered[Math.floor(filtered.length/2)].height;
+        
+        const valid = filtered.filter(p => Math.abs(p.width - medW) <= 0.3*medW && Math.abs(p.height - medH) <= 0.3*medH);
+        if (valid.length > 0) {
+          smartW = valid.reduce((sum, p) => sum + p.width, 0) / valid.length;
+          smartH = valid.reduce((sum, p) => sum + p.height, 0) / valid.length;
         }
-      }
-      
-      if (bestKey) {
-        const [w, h] = bestKey.split('x').map(Number);
-        smartW = w;
-        smartH = h;
-      } else {
-        // Fallback A4 at 72dpi
-        smartW = 595.28;
-        smartH = 841.89;
       }
     }
 
-    // Initialize Document
-    // Default orientation portrait unless smart dimension is landscape
-    const defaultOrientation = (smartW > smartH) ? 'l' : 'p';
-    let doc = new jsPDF({
-      orientation: state.pageSize === 'smart' ? defaultOrientation : 'p',
-      unit: 'pt',
-      format: state.pageSize === 'a4' ? 'a4' : (state.pageSize === 'smart' ? [smartW, smartH] : 'a4')
-    });
-    // Remove default first page
-    doc.deletePage(1);
+    const pdfDoc = await PDFDocument.create();
 
-    const A4_W = 595.28;
-    const A4_H = 841.89;
-
-    let processedCount = 0;
-    const total = pagesToProcess.length;
-
-    for (let i = 0; i < total; i++) {
+    for (let i = 0; i < pagesToProcess.length; i++) {
       const p = pagesToProcess[i];
-      setProgress(10 + Math.floor((i / total) * 80), `Processing page ${i+1} of ${total}`);
+      const ext = p.ext || 'jpeg';
+
+      const path = `zippdf/${state.jobId}/imgs/${p.index}.${ext}`;
+      const result = await Filesystem.readFile({
+        directory: Directory.Cache,
+        path: path
+      });
       
-      try {
-        const img = await loadImage(p.thumbnailUrl);
-        const origW = img.width;
-        const origH = img.height;
-        
-        let targetW, targetH;
-        let pdfW, pdfH;
-        
-        if (state.pageSize === 'original') {
-          pdfW = origW;
-          pdfH = origH;
-          doc.addPage([pdfW, pdfH], pdfW > pdfH ? 'l' : 'p');
-          doc.addImage(img, 'JPEG', 0, 0, pdfW, pdfH, undefined, 'FAST');
-        } 
-        else if (state.pageSize === 'a4') {
-          pdfW = A4_W;
-          pdfH = A4_H;
-          doc.addPage('a4', 'p');
-          
-          // Fit into A4
-          const scale = Math.min(pdfW / origW, pdfH / origH);
-          targetW = origW * scale;
-          targetH = origH * scale;
-          const x = (pdfW - targetW) / 2;
-          const y = (pdfH - targetH) / 2;
-          
-          // White background
-          doc.setFillColor(255, 255, 255);
-          doc.rect(0, 0, pdfW, pdfH, 'F');
-          
-          doc.addImage(img, 'JPEG', x, y, targetW, targetH, undefined, 'FAST');
-        } 
-        else if (state.pageSize === 'smart') {
-          pdfW = smartW;
-          pdfH = smartH;
-          doc.addPage([pdfW, pdfH], pdfW > pdfH ? 'l' : 'p');
-          
-          // Fit into smart size
-          const scale = Math.min(pdfW / origW, pdfH / origH);
-          targetW = origW * scale;
-          targetH = origH * scale;
-          const x = (pdfW - targetW) / 2;
-          const y = (pdfH - targetH) / 2;
-          
-          doc.setFillColor(255, 255, 255);
-          doc.rect(0, 0, pdfW, pdfH, 'F');
-          doc.addImage(img, 'JPEG', x, y, targetW, targetH, undefined, 'FAST');
-        }
-        
-      } catch(e) {
-        console.error("Failed to add page", p.entryName, e);
+      let imageBytes = base64ToUint8Array(result.data);
+      let image;
+      if (ext === 'png') {
+        image = await pdfDoc.embedPng(imageBytes);
+      } else {
+        image = await pdfDoc.embedJpg(imageBytes);
       }
-      processedCount++;
+
+      let pageW = smartW, pageH = smartH;
+      if (state.pageSize === 'original') {
+        pageW = p.width; pageH = p.height;
+      } else if (state.pageSize === 'a4') {
+        pageW = 595.28; pageH = 841.89;
+      }
+
+      const pdfPage = pdfDoc.addPage([pageW, pageH]);
+      const imgAspect = image.width / image.height;
+      const pageAspect = pageW / pageH;
+      let drawW, drawH;
+
+      if (imgAspect > pageAspect) {
+        drawW = pageW;
+        drawH = pageW / imgAspect;
+      } else {
+        drawH = pageH;
+        drawW = pageH * imgAspect;
+      }
+
+      const drawX = (pageW - drawW) / 2;
+      const drawY = (pageH - drawH) / 2;
+
+      pdfPage.drawRectangle({
+        x: 0, y: 0, width: pageW, height: pageH, color: rgb(1, 1, 1),
+      });
+
+      pdfPage.drawImage(image, { x: drawX, y: drawY, width: drawW, height: drawH });
+      imageBytes = null; // Free memory
+
+      if (i % 5 === 0) {
+        setProgress(Math.floor((i / pagesToProcess.length) * 100), `Adding page ${i+1}/${pagesToProcess.length}`);
+      }
     }
 
-    setProgress(95, "Finalizing PDF...");
+    setProgress(95, 'Saving final PDF (this may take a moment)...');
     
-    // Save to Blob and get size
-    const pdfBlob = doc.output('blob');
-    state.pdfSize = pdfBlob.size;
-    state.pdfBlobUrl = URL.createObjectURL(pdfBlob);
+    // Explicit format defined in rules
+    const pdfBytes = await pdfDoc.save();
+    const base64 = uint8ArrayToBase64(pdfBytes);
     
-    state.isGenerating = false;
+    // Use the custom output folder specified in settings
+    const cleanFolder = state.outputFolder.trim().replace(/^\/+|\/+$/g, '') || 'ZipForge';
+    const fileName = sanitizePdfName(state.pdfName);
+    const outputPath = `${cleanFolder}/${fileName}`;
+    
+    await Filesystem.writeFile({
+      directory: Directory.Documents,
+      path: outputPath,
+      data: base64,
+      recursive: true
+    });
+
+    const uriResult = await Filesystem.getUri({
+      directory: Directory.Documents,
+      path: outputPath
+    });
+
+    state.pdfPath = uriResult.uri;
+    
+    await updateState(state.jobId, {
+      status: 'complete',
+      progress: 100,
+      pdfPath: state.pdfPath,
+      outputPath: outputPath,
+      completedAt: new Date().toISOString()
+    });
+
     goto('complete');
 
   } catch (e) {
-    console.error(e);
-    state.isGenerating = false;
-    const main = qs('#main-content');
-    main.innerHTML += `
-      <div class="error-box">
-        <h3>Generation failed</h3>
-        <p>${e.message || 'An unexpected error occurred during offline generation.'}</p>
-        <button class="btn btn-ghost" onclick="App.goto('review')">← Go back</button>
-      </div>`;
+    console.error("PDF Generation Error", e);
+    toast('Generation failed: ' + e.message, 'error');
+    clearCache();
   }
 }
 
 /* ── Step: Complete ──────────────────────────────────────────────────────── */
 function renderComplete() {
-  const elapsed = state.startTime ? fmtTime(Date.now() - state.startTime) : '—';
-  const sizeFmt = state.pdfSize ? fmtSize(state.pdfSize) : '—';
-
   qs('#main-content').innerHTML = `
-    <div class="complete-wrap">
-      <div class="success-icon" aria-hidden="true">${icons.check}</div>
-
-      <div class="section-heading" style="text-align:center">
-        <h1>PDF ready!</h1>
-        <p>Your images have been successfully merged offline.</p>
+    <div style="display:flex; flex-direction:column; align-items:center; text-align:center; padding: 24px 16px;">
+      <div style="background: linear-gradient(135deg, var(--accent) 0%, #a25dfa 100%); width: 80px; height: 80px; border-radius: 50%; display: flex; align-items: center; justify-content: center; box-shadow: 0 12px 24px rgba(111,81,250,0.3); margin-bottom: 24px; animation: scaleIn 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
       </div>
-
-      <div class="complete-stats">
-        <div class="stat-item">
-          <div class="stat-val">${state.totalImages.toLocaleString()}</div>
-          <div class="stat-lbl">Pages</div>
+      
+      <h1 style="font-size: 28px; font-weight: 800; margin-bottom: 8px; color: var(--text-1);">Success!</h1>
+      <p style="font-size: 15px; color: var(--text-2); margin-bottom: 32px; max-width: 280px; line-height: 1.5;">Your PDF has been successfully generated and securely saved.</p>
+      
+      <div style="background: var(--bg-1); border: 1px solid var(--border); border-radius: 16px; padding: 16px; width: 100%; text-align: left; margin-bottom: 32px; display:flex; flex-direction:column; gap:12px;">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <span style="font-size: 13px; color: var(--text-3);">Filename</span>
+          <span style="font-size: 14px; font-weight: 600; color: var(--accent);">${escapeHtml(state.pdfName)}.pdf</span>
         </div>
-        <div class="stat-item">
-          <div class="stat-val">${sizeFmt}</div>
-          <div class="stat-lbl">File size</div>
-        </div>
-        <div class="stat-item">
-          <div class="stat-val">${elapsed}</div>
-          <div class="stat-lbl">Time taken</div>
+        <div style="height: 1px; background: var(--border);"></div>
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <span style="font-size: 13px; color: var(--text-3);">Location</span>
+          <span style="font-size: 12px; color: var(--text-2); max-width: 60%; word-break: break-all; text-align: right;">Internal Storage / Documents / ${escapeHtml(state.outputFolder)}</span>
         </div>
       </div>
+      
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; width: 100%; margin-bottom: 24px;">
+        <button class="btn btn-secondary" id="preview-pdf-btn" style="border-radius: 12px; padding: 14px;">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:8px;"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+          Preview
+        </button>
+        <button class="btn btn-primary" id="dl-btn" style="border-radius: 12px; padding: 14px;">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:8px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+          Open
+        </button>
+      </div>
+      
+      <button class="btn btn-secondary" id="share-btn" style="width: 100%; border-radius: 12px; margin-bottom: 24px; padding: 14px; background: rgba(255,255,255,0.05);">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:8px;"><circle cx="18" cy="5" r="3"></circle><circle cx="6" cy="12" r="3"></circle><circle cx="18" cy="19" r="3"></circle><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"></line><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"></line></svg>
+        Share PDF
+      </button>
 
-      <div class="complete-actions">
-        <button class="btn btn-success" id="dl-btn">${icons.dl} Download PDF</button>
-        <button class="btn btn-ghost"   id="again-btn">Start over (Clear Memory)</button>
+      <button id="start-over-btn" style="background: none; border: none; color: var(--text-3); font-size: 14px; font-weight: 500; cursor: pointer; text-decoration: underline; padding: 8px;">Convert Another File</button>
+    </div>
+    
+    <style>
+      @keyframes scaleIn { 0% { transform: scale(0); } 70% { transform: scale(1.1); } 100% { transform: scale(1); } }
+    </style>
+  `;
+
+  qs('#dl-btn').addEventListener('click', async () => {
+    if (state.pdfPath && FileOpener) {
+      await FileOpener.open({
+        filePath: state.pdfPath,
+        contentType: 'application/pdf',
+        openWithDefault: true
+      });
+    }
+  });
+
+  qs('#preview-pdf-btn').addEventListener('click', openFlipbookPreview);
+
+  qs('#share-btn').addEventListener('click', async () => {
+    if (state.pdfPath && Share) {
+      await Share.share({
+        title: state.pdfName,
+        url: state.pdfPath,
+        dialogTitle: 'Share your PDF'
+      });
+    }
+  });
+
+  qs('#start-over-btn').addEventListener('click', () => {
+    cleanupJob(state.jobId);
+    clearCache();
+  });
+}
+
+function openFlipbookPreview() {
+  const overlay = document.createElement('div');
+  overlay.style.cssText = `
+    position: fixed; inset: 0; background: #07090F;
+    z-index: 9999; overflow-y: auto; -webkit-overflow-scrolling: touch;
+  `;
+
+  const closeBtn = document.createElement('button');
+  closeBtn.textContent = '✕';
+  closeBtn.style.cssText = `
+    position: sticky; top: env(safe-area-inset-top, 16px);
+    left: calc(100% - 56px); display: block; width: 44px; height: 44px;
+    background: rgba(255,255,255,0.12); border: none; border-radius: 50%;
+    color: white; font-size: 18px; cursor: pointer; z-index: 10;
+    margin: 16px 16px 0 auto;
+  `;
+  closeBtn.onclick = () => overlay.remove();
+  overlay.appendChild(closeBtn);
+
+  const flipbook = document.createElement('div');
+  flipbook.style.cssText = `
+    display: flex; flex-direction: column; align-items: center;
+    gap: 4px; padding: 16px 0 calc(32px + env(safe-area-inset-bottom, 0px));
+  `;
+
+  const pages = selectedPageList();
+  pages.forEach(async (pageIdx, i) => {
+    const wrapper = document.createElement('div');
+    wrapper.style.cssText = `width: 100%; position: relative; background: #0C1018; margin-bottom: 4px;`;
+
+    const badge = document.createElement('div');
+    badge.textContent = `${i + 1}`;
+    badge.style.cssText = `
+      position: absolute; top: 8px; right: 8px; background: rgba(0,0,0,0.7);
+      color: rgba(255,255,255,0.7); font-size: 11px; font-family: monospace;
+      padding: 2px 7px; border-radius: 10px; z-index: 2;
+    `;
+    wrapper.appendChild(badge);
+
+    const img = document.createElement('img');
+    img.style.cssText = `width: 100%; height: auto; display: block;`;
+    img.loading = 'lazy';
+
+    try {
+      const path = `zippdf/${state.jobId}/imgs/${pageIdx}.${state.pages.find(p=>p.page===pageIdx)?.ext || 'jpg'}`;
+      const uriResult = await Filesystem.getUri({ directory: Directory.Cache, path: path });
+      img.src = Capacitor.convertFileSrc(uriResult.uri);
+    } catch(e) {}
+
+    wrapper.appendChild(badge);
+    wrapper.appendChild(img);
+    flipbook.appendChild(wrapper);
+  });
+
+  overlay.appendChild(flipbook);
+  document.body.appendChild(overlay);
+}
+
+/* ── History View ─────────────────────────────────────────────────────────── */
+async function renderHistory() {
+  const main = qs('#main-content');
+  main.innerHTML = `
+    <div class="screen" style="padding: 16px;">
+      <div class="header-row" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:24px;">
+        <h2 style="margin:0; font-size:22px; font-weight:700;">Recent PDFs</h2>
+        <button id="history-back-btn" class="btn-secondary" style="padding:6px 12px; font-size:12px;">Back</button>
+      </div>
+      <div id="history-list" style="display:flex; flex-direction:column; gap:12px;">
+        <div style="text-align:center; color:var(--text-3); padding:20px;">Loading history...</div>
       </div>
     </div>
   `;
 
-  qs('#dl-btn').addEventListener('click', () => {
-    if (!state.pdfBlobUrl) return;
-    const a = document.createElement('a');
-    a.href     = state.pdfBlobUrl;
-    a.download = finalPdfName() || 'zipforge_output.pdf';
-    a.click();
-  });
+  qs('#history-back-btn').addEventListener('click', () => goto('upload'));
 
-  qs('#again-btn').addEventListener('click', clearCache);
+  const listEl = qs('#history-list');
+  try {
+    const cleanFolder = state.outputFolder.trim() || 'ZipForge';
+    let res;
+    try {
+      res = await Filesystem.readdir({
+        directory: Directory.Documents,
+        path: cleanFolder
+      });
+    } catch (e) {
+      listEl.innerHTML = `<div style="text-align:center; color:var(--text-3); padding:20px;">No recent PDFs found in "${escapeHtml(cleanFolder)}".</div>`;
+      return;
+    }
+
+    const files = res.files
+      .filter(f => f.name.endsWith('.pdf'))
+      .map(f => ({
+        name: f.name,
+        path: `${cleanFolder}/${f.name}`,
+        mtime: f.mtime || 0
+      }));
+
+    if (files.length === 0) {
+      listEl.innerHTML = `<div style="text-align:center; color:var(--text-3); padding:20px;">No recent PDFs found in "${escapeHtml(cleanFolder)}".</div>`;
+      return;
+    }
+
+    // Auto-delete older than 24h
+    const now = Date.now();
+    const ONE_DAY = 24 * 60 * 60 * 1000;
+    const validFiles = [];
+
+    for (const f of files) {
+      if (f.mtime > 0 && (now - f.mtime > ONE_DAY)) {
+        try {
+          await Filesystem.deleteFile({ directory: Directory.Documents, path: f.path });
+        } catch (e) { }
+      } else {
+        validFiles.push(f);
+      }
+    }
+
+    validFiles.sort((a, b) => b.mtime - a.mtime);
+
+    if (validFiles.length === 0) {
+      listEl.innerHTML = `<div style="text-align:center; color:var(--text-3); padding:20px;">No recent PDFs found.</div>`;
+      return;
+    }
+
+    listEl.innerHTML = validFiles.map(f => `
+      <div class="complete-card" style="display:flex; justify-content:space-between; align-items:center; padding:16px; background: var(--bg-1); border: 1px solid var(--border); border-radius: 12px;">
+        <div style="display:flex; flex-direction:column; overflow:hidden; flex:1; margin-right: 12px;">
+          <span style="font-weight:600; font-size: 14px; white-space:nowrap; text-overflow:ellipsis; overflow:hidden; color: var(--text-1);">${escapeHtml(f.name)}</span>
+          <span style="font-size:11px; color:var(--text-3); margin-top:4px;">${f.mtime > 0 ? new Date(f.mtime).toLocaleString() : 'Recently generated'}</span>
+        </div>
+        <div style="display:flex; gap:8px;">
+          <button class="btn-primary open-hist-btn" data-path="${escapeHtml(f.path)}" style="padding:10px; width:auto; border-radius:8px;">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+          </button>
+          <button class="btn-secondary del-hist-btn" data-path="${escapeHtml(f.path)}" style="padding:10px; width:auto; border-radius:8px; border-color:var(--error); color:var(--error);">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+          </button>
+        </div>
+      </div>
+    `).join('');
+
+    // Listeners for history actions
+    document.querySelectorAll('.open-hist-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        if (!FileOpener) { toast('File opener not supported', 'error'); return; }
+        try {
+          const fileUri = await Capacitor.Plugins.Filesystem.getUri({ directory: Directory.Documents, path: btn.dataset.path });
+          await FileOpener.open({ filePath: fileUri.uri, contentType: 'application/pdf', openWithDefault: true });
+        } catch (e) {
+          toast('Failed to open PDF', 'error');
+        }
+      });
+    });
+
+    document.querySelectorAll('.del-hist-btn').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        const path = btn.dataset.path;
+        try {
+          await Filesystem.deleteFile({ directory: Directory.Documents, path });
+          toast('PDF Deleted', 'success');
+          renderHistory(); // Refresh
+        } catch (e) {
+          toast('Failed to delete', 'error');
+        }
+      });
+    });
+
+  } catch (e) {
+    listEl.innerHTML = `<div style="text-align:center; color:var(--error); padding:20px;">Failed to load history</div>`;
+  }
 }
-
-/* ── Navigation ──────────────────────────────────────────────────────────── */
-function goto(step) {
-  state.step = step;
-  renderStepNav();
-  qs('#main-content')?.classList.toggle('wide', step === 'preview');
-  const renders = {
-    upload:     renderUpload,
-    review:     renderReview,
-    preview:    renderPreview,
-    processing: renderProcessing,
-    complete:   renderComplete,
-  };
-  renders[step]?.();
-}
-
-function resetApp() {
-  clearCache();
-}
-
-/* ── Bootstrap ───────────────────────────────────────────────────────────── */
-window.App = { goto, resetApp };
-goto('upload');
