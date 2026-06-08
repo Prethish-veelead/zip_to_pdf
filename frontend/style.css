@@ -148,10 +148,7 @@ input { font-family: inherit; }
   padding: 14px 16px;
   height: 56px;
   border-bottom: 1px solid var(--border);
-  position: sticky;
-  top: env(safe-area-inset-top);
-  z-index: 50;
-  background: rgba(7,9,15,0.92);
+  background: var(--bg);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
 }

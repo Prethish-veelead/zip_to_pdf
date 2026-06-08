@@ -942,184 +942,58 @@ function initPreviewEvents() {
 }
 
 async function doGenerate() {
-  const btn = qs('#generate-btn');
-  const pages = selectedPageList();
-  
-  if (!pages.length) {
-    toast('Select at least one page', 'error');
-    return;
-  }
-
-  // Check RAM flag for large jobs
-  if (pages.length > 800 && isLowRamDevice()) {
-    toast('Large job — may be slow on older devices. Please wait.', 'info');
-  }
-
-  btn.disabled = true;
-  state.startTime = Date.now();
-  state.isGenerating = true;
-  
-  updateState(state.jobId, {
-    pageMode: state.pageSize,
-    pdfName: state.pdfName
-  });
-
-  goto('processing');
-  setTimeout(() => runPdfGenerationTask(pages), 100);
-}
-
-/* ── Step: Processing (pdf-lib Offline Generation) ───────────────────────── */
-function renderProcessing() {
-  qs('#main-content').innerHTML = `
-    <div class="processing-wrap">
-      <div class="section-heading" style="text-align:center">
-        <h1>Forging your PDF…</h1>
-        <p class="sub" id="progress-msg">Processing entirely offline</p>
-      </div>
-      ${getStepNavHtml()}
-
-      <div class="progress-outer">
-        <div class="progress-bar" id="progress-bar" style="width:0%"></div>
-      </div>
-      <div class="progress-meta">
-        <span id="progress-detail">Starting up</span>
-        <span class="progress-pct" id="progress-pct">0%</span>
-      </div>
-    </div>
-  `;
-}
-
-function setProgress(pct, detailMsg) {
-  const bar    = qs('#progress-bar');
-  const pctEl  = qs('#progress-pct');
-  const detail = qs('#progress-detail');
-
-  if (bar) bar.style.width = `${pct}%`;
-  if (pctEl) pctEl.textContent = `${pct}%`;
-  if (detail && detailMsg) detail.textContent = detailMsg;
-}
-
-async function runPdfGenerationTask(selectedPageNumbers) {
+  const btnasync function runPdfGenerationTask(selectedPageNumbers) {
   try {
     const s = await readState(state.jobId);
     const pagesToProcess = s.pages.filter(p => selectedPageNumbers.includes(p.index));
     
-    // Smart Auto Logic
-    let smartW = 595.28, smartH = 841.89;
-    if (state.pageSize === 'smart') {
-      let counts = { p: 0, l: 0, s: 0 };
-      pagesToProcess.forEach(p => {
-        if (p.width < p.height) counts.p++;
-        else if (p.width > p.height) counts.l++;
-        else counts.s++;
-      });
-      
-      const primary = Object.keys(counts).reduce((a, b) => counts[a] > counts[b] ? a : b);
-      const filtered = pagesToProcess.filter(p => {
-        if (primary === 'p') return p.width < p.height;
-        if (primary === 'l') return p.width > p.height;
-        return p.width === p.height;
-      });
-
-      if (filtered.length > 0) {
-        filtered.sort((a,b) => a.width - b.width);
-        const medW = filtered[Math.floor(filtered.length/2)].width;
-        filtered.sort((a,b) => a.height - b.height);
-        const medH = filtered[Math.floor(filtered.length/2)].height;
-        
-        const valid = filtered.filter(p => Math.abs(p.width - medW) <= 0.3*medW && Math.abs(p.height - medH) <= 0.3*medH);
-        if (valid.length > 0) {
-          smartW = valid.reduce((sum, p) => sum + p.width, 0) / valid.length;
-          smartH = valid.reduce((sum, p) => sum + p.height, 0) / valid.length;
-        }
-      }
-    }
-
-    const pdfDoc = await PDFDocument.create();
-
+    setProgress(10, 'Preparing images for native processing...');
+    
+    // 1. Gather absolute paths of extracted images
+    const imagePaths = [];
     for (let i = 0; i < pagesToProcess.length; i++) {
       const p = pagesToProcess[i];
       const ext = p.ext || 'jpeg';
-
       const path = `zippdf/${state.jobId}/imgs/${p.index}.${ext}`;
-      const result = await Filesystem.readFile({
+      
+      const uriResult = await Filesystem.getUri({
         directory: Directory.Cache,
         path: path
       });
-      
-      let imageBytes = base64ToUint8Array(result.data);
-      let image;
-      if (ext === 'png') {
-        image = await pdfDoc.embedPng(imageBytes);
-      } else {
-        image = await pdfDoc.embedJpg(imageBytes);
+      // BitmapFactory needs a real filesystem path, not a file:// URI
+      let realPath = uriResult.uri;
+      if (realPath.startsWith('file://')) {
+        realPath = realPath.substring(7);
       }
-
-      let pageW = smartW, pageH = smartH;
-      if (state.pageSize === 'original') {
-        pageW = p.width; pageH = p.height;
-      } else if (state.pageSize === 'a4') {
-        pageW = 595.28; pageH = 841.89;
-      }
-
-      const pdfPage = pdfDoc.addPage([pageW, pageH]);
-      const imgAspect = image.width / image.height;
-      const pageAspect = pageW / pageH;
-      let drawW, drawH;
-
-      if (imgAspect > pageAspect) {
-        drawW = pageW;
-        drawH = pageW / imgAspect;
-      } else {
-        drawH = pageH;
-        drawW = pageH * imgAspect;
-      }
-
-      const drawX = (pageW - drawW) / 2;
-      const drawY = (pageH - drawH) / 2;
-
-      pdfPage.drawRectangle({
-        x: 0, y: 0, width: pageW, height: pageH, color: rgb(1, 1, 1),
-      });
-
-      pdfPage.drawImage(image, { x: drawX, y: drawY, width: drawW, height: drawH });
-      imageBytes = null; // Free memory
-
-      if (i % 5 === 0) {
-        setProgress(Math.floor((i / pagesToProcess.length) * 100), `Adding page ${i+1}/${pagesToProcess.length}`);
-      }
+      imagePaths.push(realPath);
     }
 
-    setProgress(95, 'Saving final PDF (this may take a moment)...');
-    
-    // Explicit format defined in rules
-    const pdfBytes = await pdfDoc.save();
-    const base64 = uint8ArrayToBase64(pdfBytes);
-    
-    // Use the custom output folder specified in settings
+    setProgress(40, 'Generating PDF via Native Engine (Memory Safe)...');
+
+    // 2. Call Native Kotlin Plugin
     const cleanFolder = state.outputFolder.trim().replace(/^\/+|\/+$/g, '') || 'ZipForge';
     const fileName = sanitizePdfName(state.pdfName);
-    const outputPath = `${cleanFolder}/${fileName}`;
     
-    await Filesystem.writeFile({
-      directory: Directory.Documents,
-      path: outputPath,
-      data: base64,
-      recursive: true
+    const { NativePdfGenerator } = Capacitor.Plugins;
+    if (!NativePdfGenerator) {
+       throw new Error("NativePdfGenerator plugin not found. Please sync your Android project.");
+    }
+
+    const result = await NativePdfGenerator.generatePdf({
+       images: imagePaths,
+       outputName: fileName,
+       outputFolder: cleanFolder
     });
 
-    const uriResult = await Filesystem.getUri({
-      directory: Directory.Documents,
-      path: outputPath
-    });
+    setProgress(100, 'Saving final PDF...');
 
-    state.pdfPath = uriResult.uri;
+    state.pdfPath = result.absolutePath || result.path;
     
     await updateState(state.jobId, {
       status: 'complete',
       progress: 100,
       pdfPath: state.pdfPath,
-      outputPath: outputPath,
+      outputPath: result.path,
       completedAt: new Date().toISOString()
     });
 
@@ -1128,9 +1002,8 @@ async function runPdfGenerationTask(selectedPageNumbers) {
   } catch (e) {
     console.error("PDF Generation Error", e);
     toast('Generation failed: ' + e.message, 'error');
-    clearCache();
   }
-}
+};
 
 /* ── Step: Complete ──────────────────────────────────────────────────────── */
 function renderComplete() {
