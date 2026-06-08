@@ -942,7 +942,64 @@ function initPreviewEvents() {
 }
 
 async function doGenerate() {
-  const btnasync function runPdfGenerationTask(selectedPageNumbers) {
+  const btn = qs('#generate-btn');
+  const pages = selectedPageList();
+  
+  if (!pages.length) {
+    toast('Select at least one page', 'error');
+    return;
+  }
+
+  // Check RAM flag for large jobs
+  if (pages.length > 800 && isLowRamDevice()) {
+    toast('Large job — may be slow on older devices. Please wait.', 'info');
+  }
+
+  btn.disabled = true;
+  state.startTime = Date.now();
+  state.isGenerating = true;
+  
+  updateState(state.jobId, {
+    pageMode: state.pageSize,
+    pdfName: state.pdfName
+  });
+
+  goto('processing');
+  setTimeout(() => runPdfGenerationTask(pages), 100);
+}
+
+/* ── Step: Processing (pdf-lib Offline Generation) ───────────────────────── */
+function renderProcessing() {
+  qs('#main-content').innerHTML = `
+    <div class="processing-wrap">
+      <div class="section-heading" style="text-align:center">
+        <h1>Forging your PDF…</h1>
+        <p class="sub" id="progress-msg">Processing entirely offline</p>
+      </div>
+      ${getStepNavHtml()}
+
+      <div class="progress-outer">
+        <div class="progress-bar" id="progress-bar" style="width:0%"></div>
+      </div>
+      <div class="progress-meta">
+        <span id="progress-detail">Starting up</span>
+        <span class="progress-pct" id="progress-pct">0%</span>
+      </div>
+    </div>
+  `;
+}
+
+function setProgress(pct, detailMsg) {
+  const bar    = qs('#progress-bar');
+  const pctEl  = qs('#progress-pct');
+  const detail = qs('#progress-detail');
+
+  if (bar) bar.style.width = `${pct}%`;
+  if (pctEl) pctEl.textContent = `${pct}%`;
+  if (detail && detailMsg) detail.textContent = detailMsg;
+}
+
+async function runPdfGenerationTask(selectedPageNumbers) {
   try {
     const s = await readState(state.jobId);
     const pagesToProcess = s.pages.filter(p => selectedPageNumbers.includes(p.index));
