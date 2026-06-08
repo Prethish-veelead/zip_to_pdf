@@ -57,7 +57,3 @@ coverage/
 
 # Capacitor Build
 node_modules/
-android/
-
-node_modules/
-android/
