@@ -23,6 +23,13 @@ android {
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }
     }
+    packagingOptions {
+        exclude 'META-INF/NOTICE'
+        exclude 'META-INF/LICENSE'
+        exclude 'META-INF/*.RSA'
+        exclude 'META-INF/*.SF'
+        exclude 'META-INF/*.DSA'
+    }
 }
 
 repositories {
@@ -42,6 +49,8 @@ dependencies {
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
     implementation project(':capacitor-cordova-android-plugins')
+    implementation ('com.itextpdf:kernel:7.2.5') { exclude group: 'org.bouncycastle' }
+    implementation ('com.itextpdf:io:7.2.5')     { exclude group: 'org.bouncycastle' }
 }
 
 apply from: 'capacitor.build.gradle'

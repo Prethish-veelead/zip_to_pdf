@@ -1,79 +1,496 @@
-# zip_to_pdf
-learing and thinking possible ways
-
 # ZipForge — ZIP to PDF Converter
 
-Upload multiple ZIP files full of images → reorder them → download one merged PDF.
+Upload multiple ZIP files full of images → reorder them → select pages → generate one merged PDF on Android.
+
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Project Structure](#project-structure)
+- [Tech Stack](#tech-stack)
+- [Data Flow](#data-flow)
+- [Frontend (app.js)](#frontend-appjs)
+- [Backend (FastAPI)](#backend-fastapi)
+- [Android Native Plugin](#android-native-plugin)
+- [State & Data Structures](#state--data-structures)
+- [Configuration](#configuration)
+- [Setup & Running](#setup--running)
+- [Limits](#limits)
+
+---
+
+## Overview
+
+ZipForge is a **Capacitor 7 hybrid Android app** backed by a **FastAPI Python server**. The core workflow:
+
+1. User uploads one or more ZIP files (each containing images)
+2. App shows per-ZIP thumbnails; user reorders ZIPs via drag-and-drop
+3. Images are extracted from ZIPs one at a time to device storage (memory-safe)
+4. User previews all pages, selects/deselects, picks page size
+5. Native Android Kotlin plugin generates the PDF using `android.graphics.pdf.PdfDocument`
+6. User opens, shares, or downloads the final PDF
+
+The memory-safety design is the key innovation: images are never all loaded into RAM at once. They stream from ZIP → device storage → native PDF canvas, with `bitmap.recycle()` called after every page.
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────┐
+│         Android APK (Capacitor 7)        │
+│                                         │
+│  ┌──────────────────────────────────┐   │
+│  │  WebView (frontend/)             │   │
+│  │  HTML + CSS + Vanilla JS         │   │
+│  │  JSZip · Sortable.js             │   │
+│  └────────────┬─────────────────────┘   │
+│               │ Capacitor Bridge        │
+│  ┌────────────▼─────────────────────┐   │
+│  │  Native Plugins                  │   │
+│  │  • NativePdfGenerator (Kotlin)   │   │
+│  │  • @capacitor/filesystem         │   │
+│  │  • @capacitor/share              │   │
+│  │  • @capacitor-community/file-opener│  │
+│  └──────────────────────────────────┘   │
+└─────────────────────────────────────────┘
+         │ HTTP (optional, web mode)
+┌────────▼────────────────────────────────┐
+│  FastAPI Python Backend                 │
+│  main.py · worker.py · database.py      │
+│  Pillow · ReportLab · SQLite            │
+└─────────────────────────────────────────┘
+```
+
+The FastAPI backend is used in **web/desktop mode** only. In the Android app, all processing (ZIP extraction, PDF generation) happens on-device via Capacitor plugins — the backend is bypassed.
+
+---
 
 ## Project Structure
 
 ```
-zip-to-pdf/
+zip_to_pdf/
 ├── frontend/
-│   ├── index.html     ← HTML shell
-│   ├── style.css      ← Dark "forge" theme, fully responsive
-│   └── app.js         ← State machine, API calls, drag-to-reorder
-└── backend/
-    ├── main.py        ← FastAPI routes
-    ├── worker.py      ← Background PDF generation (memory-safe)
-    ├── database.py    ← SQLite helpers
-    ├── config.py      ← Settings (limits, paths)
-    └── requirements.txt
+│   ├── index.html              # HTML shell: Capacitor scaffold, modals, nav
+│   ├── app.js                  # ~1350 lines: full state machine, ZIP handling, UI rendering
+│   ├── style.css               # ~500 lines: dark/light theme, mobile-first responsive
+│   └── libs/
+│       ├── jszip.min.js        # ZIP file parsing
+│       └── Sortable.min.js     # Drag-to-reorder lists
+│
+├── backend/
+│   ├── main.py                 # FastAPI routes (upload, job status, download, cleanup)
+│   ├── worker.py               # Background PDF generation worker (memory-safe streaming)
+│   ├── database.py             # SQLite connection + schema helpers
+│   ├── config.py               # Limits and settings constants
+│   ├── requirements.txt        # Python dependencies
+│   ├── jobs.db                 # SQLite database (auto-created)
+│   └── uploads/                # Temporary job storage (auto-created)
+│
+├── android/
+│   └── app/src/main/
+│       ├── java/com/zipforge/app/
+│       │   ├── MainActivity.java          # Capacitor entry point; registers plugins
+│       │   └── NativePdfGenerator.kt      # Native PDF generation plugin (Kotlin)
+│       ├── assets/public/                 # Bundled frontend (copied by Capacitor sync)
+│       ├── AndroidManifest.xml            # Permissions + largeHeap config
+│       └── res/                           # Icons and splash screens
+│
+├── capacitor.config.json       # App ID: com.veelead.ziptopdf; webDir: frontend
+├── package.json                # Capacitor 7 npm dependencies
+└── README.md                   # This file
 ```
 
-## Setup
+---
 
-### Backend
+## Tech Stack
+
+| Layer | Technology | Purpose |
+|-------|-----------|---------|
+| Frontend UI | HTML5 + CSS3 | Shell and responsive layout |
+| Frontend Logic | Vanilla JavaScript (ES6+) | State machine, ZIP parsing, UI rendering |
+| ZIP Library | JSZip | Client-side ZIP reading |
+| Drag-Drop | Sortable.js | ZIP card reordering |
+| Mobile Framework | Capacitor 7.x | WebView → Android native bridge |
+| Native PDF | Kotlin + `android.graphics.pdf.PdfDocument` | Memory-efficient PDF generation |
+| Native I/O | `@capacitor/filesystem` | Read/write to device cache + data dirs |
+| Backend API | FastAPI + Uvicorn | REST API for web mode |
+| Image Processing | Pillow (PIL) | Resize, format-convert images |
+| PDF Generation (web) | ReportLab | PDF creation on backend |
+| Database | SQLite | Job state persistence (backend) |
+| Build | Gradle + Kotlin plugin | Android APK compilation |
+
+---
+
+## Data Flow
+
+```
+USER UPLOADS ZIPs
+       │
+       ▼
+app.js: renderUpload() + initUploadZone()
+  • Validate: .zip only, ≤300MB each, ≤30 files
+  • Collect in state.selected[]
+       │
+       ▼
+doUpload() → POST /api/jobs  [WEB MODE ONLY]
+  OR
+state saved locally           [ANDROID MODE]
+  • Backend: stream files to disk (256KB chunks)
+  • generate_thumbnail() → first image → 240×320 JPEG
+  • count_images() → count valid image entries
+  • INSERT into jobs + job_zips tables
+  • Returns {jobId, zips: [{id, name, size, imageCount, ...}]}
+       │
+       ▼
+app.js: renderReview()
+  • Show ZIP cards with thumbnails
+  • Sortable.js drag-to-reorder on .zip-list
+  • Input PDF output name (auto-filled from first ZIP name)
+  • User clicks "Extract & Preview"
+       │
+       ▼
+doExtraction() → extractZipToStorage(jobId, sortedZips)
+  • JSZip reads each ZIP file
+  • For each image in each ZIP (one at a time):
+      - Extract ArrayBuffer
+      - Get dimensions
+      - Write full image to CACHE/zippdf/{jobId}/imgs/
+      - Write thumbnail to CACHE/zippdf/{jobId}/thumbs/
+      - Append to stateData.pages[]
+  • Write state.json to DATA/zippdf/{jobId}/
+  • Progress: 0%→50% during extraction
+       │
+       ▼
+app.js: renderPreview()
+  • Load thumbnails from Capacitor Filesystem
+  • Show page grid with checkboxes
+  • Page size options: Original | A4 | Smart Auto
+  • User selects/deselects pages
+  • User clicks "Generate PDF"
+       │
+       ▼
+doGenerate() → runPdfGenerationTask(selectedPageNumbers)
+  • Collect absolute file paths of selected images
+  • Call NativePdfGenerator.generatePdf({images, outputName, outputFolder})
+  • Progress: 10% → 40% → 100%
+       │
+       ▼
+NativePdfGenerator.kt (background thread)
+  • For each image path:
+      BitmapFactory.decodeFile()  → load bitmap (native memory)
+      PdfDocument.PageInfo(width, height)
+      canvas.drawBitmap()
+      bitmap.recycle()            → FREE MEMORY IMMEDIATELY
+  • Write PDF to Documents/{outputFolder}/{fileName}.pdf
+  • Return {relativePath, absolutePath}
+       │
+       ▼
+app.js: renderComplete()
+  • Success animation + file size info
+  • Buttons: Open | Preview | Share | Convert Another
+  • renderHistory(): list recent PDFs; auto-delete >24h old
+```
+
+---
+
+## Frontend (app.js)
+
+### Global State Object
+
+```javascript
+state = {
+  step: 'upload|review|preview|processing|complete',
+  zips: [
+    {id, name, size, imageCount, order, fileObj, validImages}
+  ],
+  pages: [
+    {page, zipId, imageName, entryName, ext, thumbnailUrl}
+  ],
+  selectedPages: Set<pageNumber>,
+  jobId: 'job_TIMESTAMP_RANDOM',
+  totalImages: number,
+  pdfName: string,
+  pageSize: 'original|a4|smart',
+  outputFolder: string,
+  isGenerating: boolean
+}
+```
+
+### Key Functions
+
+| Function | Purpose |
+|----------|---------|
+| `addFiles(files)` | Validate and add ZIP files to `state.selected` |
+| `doUpload()` | Send ZIPs to backend or process locally; get job ID |
+| `extractZipToStorage(jobId, zips)` | Extract images one-by-one to Capacitor Filesystem |
+| `runPdfGenerationTask(pages)` | Gather image paths, call native PDF plugin |
+| `renderUpload()` | Upload zone with drag-drop area |
+| `renderReview()` | ZIP cards with thumbnails + Sortable drag handles |
+| `renderPreview()` | Page grid with checkboxes + page size selector |
+| `renderProcessing()` | Animated progress bar + status messages |
+| `renderComplete()` | Success screen with action buttons |
+| `renderHistory()` | Recent PDFs list (loads from Documents dir) |
+| `cleanupJob(jobId)` | Remove extracted images + state file for a job |
+| `cleanupAbandonedJobs()` | Clean up jobs older than 24h from cache |
+| `cleanupOldPDFs()` | Delete PDFs older than 24h from Documents |
+
+### Step Navigation
+
+```
+upload → review → preview → processing → complete
+  ●         ○         ○          ○            ○
+```
+
+Steps rendered by `STEPS` array; active step shown in top progress dots.
+
+### Theme System
+
+- Dark theme default (`--bg: #07090F`, accent `--accent: #E8A020`)
+- Light theme toggled via `data-theme="light"` on `<html>`
+- Persisted in `localStorage.theme`
+
+---
+
+## Backend (FastAPI)
+
+### API Routes
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/jobs` | Create job from uploaded ZIP files |
+| `GET` | `/api/jobs/{job_id}` | Get job status + ZIP list |
+| `PUT` | `/api/jobs/{job_id}/order` | Update ZIP order |
+| `POST` | `/api/jobs/{job_id}/start` | Start PDF generation |
+| `GET` | `/api/jobs/{job_id}/pages` | Get page preview list |
+| `GET` | `/api/jobs/{job_id}/pages/{page}/thumbnail` | Serve page thumbnail JPEG |
+| `GET` | `/api/jobs/{job_id}/thumbnail/{zip_order}` | Serve ZIP thumbnail JPEG |
+| `GET` | `/api/jobs/{job_id}/download` | Download final PDF |
+| `DELETE` | `/api/jobs/{job_id}` | Clean up job files + DB records |
+
+### SQLite Schema
+
+```sql
+CREATE TABLE jobs (
+  id           TEXT PRIMARY KEY,
+  status       TEXT,    -- 'uploaded' | 'pending' | 'processing' | 'complete' | 'error'
+  created_at   REAL,
+  progress     INTEGER, -- 0-100
+  progress_msg TEXT,
+  total_images INTEGER,
+  output_name  TEXT,    -- PDF filename
+  page_size    TEXT,    -- 'original' | 'a4' | 'smart'
+  pdf_path     TEXT,
+  pdf_size     INTEGER,
+  error        TEXT
+);
+
+CREATE TABLE job_zips (
+  id             INTEGER PRIMARY KEY,
+  job_id         TEXT REFERENCES jobs(id),
+  zip_name       TEXT,
+  zip_order      INTEGER,
+  stored_path    TEXT,
+  size_bytes     INTEGER,
+  thumbnail_path TEXT,
+  image_count    INTEGER
+);
+```
+
+### Background Worker (worker.py)
+
+| Function | Description |
+|----------|-------------|
+| `count_images(zip_path)` | Count valid image entries in a ZIP |
+| `generate_thumbnail(zip_path, job_id, zip_order)` | Extract first image, resize to 240×320, save as JPEG |
+| `generate_page_previews(job_id)` | Extract + resize all images; return page list |
+| `process_job(job_id, selected_pages, page_size)` | Background thread: stream images → ReportLab PDF |
+
+**Page size modes:**
+- `original` — each page matches the image's native pixel dimensions
+- `a4` — all pages 595.27×841.89 pts; image centered with letterboxing
+- `smart` — analyzes all images, picks most common size, applies to all pages
+
+---
+
+## Android Native Plugin
+
+### NativePdfGenerator.kt
+
+**Plugin name:** `NativePdfGenerator`  
+**Capacitor method:** `generatePdf`
+
+**Parameters:**
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `images` | `JSArray` | Absolute file paths to extracted images |
+| `outputName` | `String` | PDF filename (with or without .pdf) |
+| `outputFolder` | `String` | Subfolder under Documents/ |
+
+**Process:**
+
+```kotlin
+for (imagePath in images) {
+    val bitmap = BitmapFactory.decodeFile(imagePath)
+    val pageInfo = PdfDocument.PageInfo.Builder(bitmap.width, bitmap.height, pageNum).create()
+    val page = pdf.startPage(pageInfo)
+    page.canvas.drawBitmap(bitmap, 0f, 0f, null)
+    pdf.finishPage(page)
+    bitmap.recycle()   // ← critical: free native memory immediately
+}
+// write to Documents/{outputFolder}/{outputName}.pdf
+```
+
+**Returns:** `{ relativePath: string, absolutePath: string }`
+
+**Threading:** Runs entirely on a background thread (`taskQueue`) to prevent ANR.
+
+### AndroidManifest Permissions
+
+```xml
+<uses-permission android:name="android.permission.INTERNET" />
+<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+```
+
+`android:largeHeap="true"` is set on `<application>` to allow expanded heap for large image sets.
+
+---
+
+## State & Data Structures
+
+### Capacitor Filesystem Layout
+
+```
+CACHE/zippdf/{jobId}/
+  imgs/
+    0_0_image.jpg       # {zipIndex}_{imageIndex}_{originalName}
+    0_1_image.jpg
+    1_0_image.jpg
+    ...
+  thumbs/
+    0_0_image.jpg       # Scaled thumbnails (same naming)
+    ...
+
+DATA/zippdf/{jobId}/
+  state.json            # Job metadata + full pages list
+```
+
+### state.json Schema
+
+```json
+{
+  "jobId": "job_1749999999999_abc123",
+  "status": "complete",
+  "progress": 100,
+  "processedImages": 150,
+  "totalImages": 150,
+  "pdfName": "MyDocument",
+  "pageMode": "smart",
+  "createdAt": 1749999999999,
+  "completedAt": 1750000001234,
+  "pages": [
+    {
+      "index": 0,
+      "fileName": "0_0_page001.jpg",
+      "width": 2480,
+      "height": 3508,
+      "ext": ".jpg"
+    }
+  ]
+}
+```
+
+---
+
+## Configuration
+
+### backend/config.py
+
+```python
+MAX_ZIP_COUNT     = 30          # Maximum number of ZIP files per job
+MAX_ZIP_SIZE_MB   = 300         # Maximum size per ZIP file
+MAX_TOTAL_SIZE_MB = 1000        # Maximum total upload size
+ALLOWED_IMAGE_EXTS = {
+    '.jpg', '.jpeg', '.png', '.webp',
+    '.jfif', '.bmp', '.tiff', '.gif'
+}
+THUMBNAIL_SIZE    = (240, 320)  # Preview thumbnail dimensions
+DEFAULT_DPI       = 96.0        # DPI fallback for images without EXIF DPI
+TTL_MINUTES       = 30          # Job time-to-live (web mode)
+```
+
+### capacitor.config.json
+
+```json
+{
+  "appId": "com.veelead.ziptopdf",
+  "appName": "zip_to_pdf",
+  "webDir": "frontend"
+}
+```
+
+---
+
+## Setup & Running
+
+### Android App
+
+```bash
+# Install Node dependencies
+npm install
+
+# Sync frontend + plugins to Android project
+npx cap sync android
+
+# Open in Android Studio
+npx cap open android
+# Then: Build > Build APK  (or Run on device)
+```
+
+### Backend (Web / Dev Mode)
 
 ```bash
 cd backend
 python -m venv venv
-source venv/bin/activate          # Windows: venv\Scripts\activate
+venv\Scripts\activate       # Windows
 pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
+# Open: http://localhost:8000
 ```
 
-The backend serves the frontend automatically from `../frontend/`.
-Open → http://localhost:8000
-
-### Dev: Frontend only (separate server)
-
-If you want live-reload on the frontend, serve it from a separate port:
+### Frontend Dev Server (hot reload)
 
 ```bash
-# e.g. using Python's built-in server
 cd frontend
 python -m http.server 5500
+# Open: http://localhost:5500
+# app.js auto-detects port 5500 and targets API at localhost:8000
 ```
-
-The frontend auto-detects port 5500 and sends API calls to `http://localhost:8000`.
 
 ---
 
-## Features (Phase 1)
-
-- Upload up to 30 ZIP files
-- Per-ZIP thumbnail preview (first image from each ZIP)
-- Drag-and-drop ZIP reordering (works on Android + desktop)
-- Memory-safe PDF generation (one image in RAM at a time)
-- Progress bar with live status
-- Download generated PDF
-
 ## Limits
 
-| Setting              | Default   |
-|----------------------|-----------|
-| Max ZIP files        | 30        |
-| Max ZIP size         | 300 MB    |
-| Supported images     | JPG PNG WEBP BMP TIFF GIF JFIF |
+| Setting | Value |
+|---------|-------|
+| Max ZIP files per job | 30 |
+| Max size per ZIP | 300 MB |
+| Max total upload size | 1,000 MB |
+| Supported image formats | JPG, JPEG, PNG, WEBP, BMP, TIFF, GIF, JFIF |
+| Job TTL (web mode) | 30 minutes |
+| PDF auto-delete (device) | 24 hours |
+| Thumbnail size | 240 × 320 px |
+
+---
 
 ## Notes
 
 - Free hosting (Render Free) works for demos with ≤ 50 MB ZIPs.
-- For 300–400 MB ZIPs with 2000+ images: use a paid VM or container.
-- SQLite is used for MVP; swap in Postgres if you scale beyond one worker.
-git init
-git add .
-git commit -m "first commit"
-git branch -M main
-git push -u origin main
+- For 300–400 MB ZIPs with 2000+ images: use a paid VM or container with ≥2 GB RAM.
+- SQLite is used for MVP; swap in Postgres for multi-worker deployments.
+- CORS is open to all origins in `main.py` — restrict for production.
+- The backend is **not used** in Android mode; all processing is on-device.

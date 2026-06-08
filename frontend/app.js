@@ -1083,7 +1083,8 @@ async function runPdfGenerationTask(selectedPageNumbers) {
     const result = await NativePdfGenerator.generatePdf({
        images: imagePaths,
        outputName: fileName,
-       outputFolder: cleanFolder
+       outputFolder: cleanFolder,
+       pageSize: state.pageSize
     });
 
     setProgress(100, 'Saving final PDF...');
