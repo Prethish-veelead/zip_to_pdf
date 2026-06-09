@@ -36,8 +36,8 @@ class NativePdfGenerator : Plugin() {
             try {
                 val imagePaths = (0 until images.length()).mapNotNull { images.getString(it) }
 
-                val publicDocsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
-                val appDir = File(publicDocsDir, outputFolder)
+                val cacheDir = context.cacheDir
+                val appDir = File(cacheDir, "ZipForgeCache")
                 if (!appDir.exists()) appDir.mkdirs()
 
                 val finalFileName = if (outputName.endsWith(".pdf")) outputName else "$outputName.pdf"
@@ -92,7 +92,7 @@ class NativePdfGenerator : Plugin() {
                 pdfDoc.close()
 
                 val ret = JSObject()
-                ret.put("path", "$outputFolder/$finalFileName")
+                ret.put("path", "ZipForgeCache/$finalFileName")
                 ret.put("absolutePath", outputFile.absolutePath)
                 call.resolve(ret)
 

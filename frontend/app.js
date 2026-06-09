@@ -1087,15 +1087,39 @@ async function runPdfGenerationTask(selectedPageNumbers) {
        pageSize: state.pageSize
     });
 
+    setProgress(95, 'Moving PDF to public Documents...');
+
+    const docPath = `${cleanFolder}/${fileName}`;
+    
+    // Copy the generated PDF from Cache to public Documents
+    await Filesystem.copy({
+      from: result.path,
+      directory: Directory.Cache,
+      to: docPath,
+      toDirectory: Directory.Documents
+    });
+
+    // Optionally delete the cache file to free up memory
+    await Filesystem.deleteFile({
+      path: result.path,
+      directory: Directory.Cache
+    }).catch(e => console.warn("Failed to clean up cache:", e));
+
     setProgress(100, 'Saving final PDF...');
 
-    state.pdfPath = result.absolutePath || result.path;
+    // Get the final URI so FileOpener/Share can use it
+    const finalUri = await Filesystem.getUri({
+      path: docPath,
+      directory: Directory.Documents
+    });
+
+    state.pdfPath = finalUri.uri;
     
     await updateState(state.jobId, {
       status: 'complete',
       progress: 100,
       pdfPath: state.pdfPath,
-      outputPath: result.path,
+      outputPath: docPath,
       completedAt: new Date().toISOString()
     });
 
