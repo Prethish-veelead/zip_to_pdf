@@ -524,7 +524,6 @@ async function extractZipToStorage(jobId, zips) {
       
       const dims = await getImageDimensionsFromBuffer(buffer, mime);
 
-      // Write full image
       const base64Data = bufferToBase64Image(buffer, ext);
       await Filesystem.writeFile({
         directory: Directory.Cache,
@@ -532,14 +531,7 @@ async function extractZipToStorage(jobId, zips) {
         data: base64Data,
         recursive: true
       });
-
-      // Write same image as thumbnail
-      await Filesystem.writeFile({
-        directory: Directory.Cache,
-        path: `zippdf/${jobId}/thumbs/${globalIdx}.${ext}`,
-        data: base64Data,
-        recursive: true
-      });
+      // Thumbnails reuse the imgs/ files — no duplicate write needed.
 
       stateData.pages.push({
         index: globalIdx,
@@ -894,6 +886,20 @@ function renderPreview() {
           </div>
         </label>
         <label class="radio-label">
+          <input type="radio" name="page-size" value="tight" ${state.pageSize === 'tight' ? 'checked' : ''}>
+          <div class="radio-content">
+            <span class="radio-title">Tight (No Upscaling)</span>
+            <span class="radio-desc">Fits image exactly, large images reduced</span>
+          </div>
+        </label>
+        <label class="radio-label">
+          <input type="radio" name="page-size" value="uniform" ${state.pageSize === 'uniform' ? 'checked' : ''}>
+          <div class="radio-content">
+            <span class="radio-title">Uniform (Upscaling Allowed)</span>
+            <span class="radio-desc">All pages match the largest image size</span>
+          </div>
+        </label>
+        <label class="radio-label">
           <input type="radio" name="page-size" value="a4" ${state.pageSize === 'a4' ? 'checked' : ''}>
           <div class="radio-content">
             <span class="radio-title">A4</span>
@@ -953,7 +959,7 @@ async function lazyLoadStorageThumbnails() {
   for (const p of state.pages) {
     if (!p.thumbnailUrl) {
       try {
-        const path = `zippdf/${state.jobId}/thumbs/${p.page}.${p.ext || 'jpg'}`;
+        const path = `zippdf/${state.jobId}/imgs/${p.page}.${p.ext || 'jpg'}`;
         const result = await Filesystem.getUri({ directory: Directory.Cache, path: path });
         p.thumbnailUrl = Capacitor.convertFileSrc(result.uri);
       } catch(e) {}
@@ -1029,6 +1035,10 @@ function renderProcessing() {
         <span id="progress-detail">Starting up</span>
         <span class="progress-pct" id="progress-pct">0%</span>
       </div>
+      
+      <div id="animation-container" style="display: flex; justify-content: center; align-items: center; width: 100%; margin: 40px 0 20px 0;">
+        <img id="process-animation" class="processing-animation" src="extracting.svg" alt="Processing Animation" style="height: 140px; object-fit: contain;" />
+      </div>
     </div>
   `;
 }
@@ -1037,10 +1047,22 @@ function setProgress(pct, detailMsg) {
   const bar    = qs('#progress-bar');
   const pctEl  = qs('#progress-pct');
   const detail = qs('#progress-detail');
+  const anim   = qs('#process-animation');
 
   if (bar) bar.style.width = `${pct}%`;
   if (pctEl) pctEl.textContent = `${pct}%`;
   if (detail && detailMsg) detail.textContent = detailMsg;
+
+  if (anim) {
+    const currentSrc = anim.getAttribute('src') || '';
+    if (pct < 40 && currentSrc !== 'extracting.svg') {
+      anim.setAttribute('src', 'extracting.svg');
+    } else if (pct >= 40 && pct < 90 && currentSrc !== 'forging.svg') {
+      anim.setAttribute('src', 'forging.svg');
+    } else if (pct >= 90 && currentSrc !== 'merging.svg') {
+      anim.setAttribute('src', 'merging.svg');
+    }
+  }
 }
 
 async function runPdfGenerationTask(selectedPageNumbers) {
@@ -1069,9 +1091,6 @@ async function runPdfGenerationTask(selectedPageNumbers) {
       imagePaths.push(realPath);
     }
 
-    setProgress(40, 'Generating PDF via Native Engine (Memory Safe)...');
-
-    // 2. Call Native Kotlin Plugin
     const cleanFolder = state.outputFolder.trim().replace(/^\/+|\/+$/g, '') || 'ZipForge';
     const fileName = sanitizePdfName(state.pdfName);
     
@@ -1080,11 +1099,34 @@ async function runPdfGenerationTask(selectedPageNumbers) {
        throw new Error("NativePdfGenerator plugin not found. Please sync your Android project.");
     }
 
-    const result = await NativePdfGenerator.generatePdf({
-       images: imagePaths,
-       outputName: fileName,
-       outputFolder: cleanFolder,
-       pageSize: state.pageSize
+    const CHUNK_SIZE = 100;
+    const numChunks = Math.ceil(imagePaths.length / CHUNK_SIZE);
+    const chunkPdfPaths = [];
+
+    for (let i = 0; i < numChunks; i++) {
+        const start = i * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, imagePaths.length);
+        const chunkImages = imagePaths.slice(start, end);
+        
+        const chunkPercent = Math.floor((i / numChunks) * 50); // 40% to 90%
+        setProgress(40 + chunkPercent, `Generating PDF chunk ${i + 1} of ${numChunks}...`);
+
+        const chunkResult = await NativePdfGenerator.generatePdf({
+            images: chunkImages,
+            outputName: `temp_chunk_${state.jobId}_${i}.pdf`,
+            outputFolder: cleanFolder,
+            pageSize: state.pageSize
+        });
+        
+        chunkPdfPaths.push(chunkResult.path);
+    }
+
+    setProgress(90, 'Merging all PDF chunks into final file...');
+    
+    const result = await NativePdfGenerator.mergePdfs({
+        chunks: chunkPdfPaths,
+        outputName: fileName,
+        outputFolder: cleanFolder
     });
 
     setProgress(95, 'Moving PDF to public Documents...');

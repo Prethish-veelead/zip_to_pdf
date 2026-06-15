@@ -494,3 +494,93 @@ python -m http.server 5500
 - SQLite is used for MVP; swap in Postgres for multi-worker deployments.
 - CORS is open to all origins in `main.py` — restrict for production.
 - The backend is **not used** in Android mode; all processing is on-device.
+
+---
+
+## Changelog & Implementation Notes
+
+### PDF Engine Migration: Android PdfDocument → iText
+
+The original native plugin used `android.graphics.pdf.PdfDocument` with `BitmapFactory.decodeFile()` + `canvas.drawBitmap()`. This caused two problems:
+
+1. **File size explosion** — each JPEG was fully decompressed into a raw ARGB bitmap before being re-encoded into the PDF. A 30 MB ZIP produced a 60–120 MB PDF.
+2. **Quality loss** — Android's PDF canvas re-compressed images, introducing a second lossy JPEG compression on top of the original.
+
+The plugin was migrated to **iText** (`com.itextpdf`). iText reads JPEG bytes directly and embeds them as a `DCTDecode` stream — no decompression, no re-encoding. Result: a 30 MB ZIP now produces a ~32 MB PDF with **zero quality loss**.
+
+| | Old (Android PdfDocument) | New (iText) |
+|--|--------------------------|-------------|
+| 30 MB ZIP → PDF size | 60–120 MB | ~32 MB |
+| Image quality | Reduced (double compression) | 100% original |
+| How images are stored | Re-encoded pixels | Original JPEG bytes |
+
+---
+
+### PDF Page Size Modes
+
+Three modes are available, selectable in the Preview step:
+
+| Mode | Behaviour |
+|------|-----------|
+| **Original** | Each page matches the image's exact pixel dimensions. No scaling. |
+| **A4** | All pages fixed at 595×842 pt. Images scaled to fit with letterboxing/pillarboxing, centered. |
+| **Smart Auto** | Analyses all images; picks the dominant size per orientation group. See below. |
+
+**Why file sizes look the same across all three modes:**
+iText embeds JPEG image data as-is regardless of page size. Changing page layout only affects the PDF coordinate geometry, not the image bytes. All three modes will produce near-identical file sizes for the same input ZIP.
+
+The visual difference is in page dimensions and image positioning — open the PDF to verify the mode is working correctly, not the file size.
+
+---
+
+### Smart Auto Mode — Implementation Detail
+
+**Previous behaviour (single dominant size):**
+- Scanned all image headers with `BitmapFactory.inJustDecodeBounds`
+- Found the single most common `width×height` pair
+- Used that as the page size for every image
+
+**Problems with the old approach:**
+
+| Scenario | Problem |
+|----------|---------|
+| `2480×3508` mixed with `1240×1754` (half size) | Half-size images scaled UP 2× → blurry |
+| `2480×3508` mixed with `3508×2480` (portrait + landscape) | Landscape squished into tall portrait pages |
+
+**Current behaviour (orientation-aware, no scale-up):**
+
+Two dominant sizes are now computed — one for portrait images (`width ≤ height`) and one for landscape (`width > height`). Each image is placed on a page matching its own orientation group's dominant size.
+
+Additionally, scale is capped at `1.0f` in Smart mode: images smaller than the dominant page size are **never scaled up**. They are centered at their native resolution with white space around them, preserving sharpness.
+
+```kotlin
+// Portrait and landscape are analysed separately
+val smartSizes = computeSmartSizes(imagePaths)  // returns SmartSizes(portrait, landscape)
+
+// Each image picks the page size matching its orientation
+val target = if (isLandscape) smartSizes.landscape else smartSizes.portrait
+
+// Scale capped at 1.0 — never blow up a small image
+val scale = minOf(pageW / imgW, pageH / imgH, 1.0f)
+```
+
+**How each scenario is handled now:**
+
+| Scenario | Result |
+|----------|--------|
+| `2480×3508` + `1240×1754` (half size) | Small images centered at native size, white border around them |
+| `2480×3508` + `3508×2480` (portrait + landscape) | Portrait gets portrait page, landscape gets landscape page |
+| `2480×3508` + `2000×2500` (different sizes) | Proportional scale-down, centered — minor white bars |
+
+---
+
+### Known Issue: Image Naming Conflicts in ZIP
+
+ZIP files containing images named with and without leading zeros (e.g. `001.jpg` alongside `1.jpg`) cause ordering and path-resolution issues:
+
+- **Lexicographic sort** places all `0xx` files before `1.jpg`–`7.jpg`, duplicating the first 7 pages at the end.
+- **Natural sort** treats `001` and `1` as the same number → one of each pair may be silently dropped from a map/object.
+
+With a ZIP of 49 files (`001`–`049`) plus 7 files (`1`–`7`), up to 7 images can be lost and the remaining 49 appear in the wrong order. The native plugin then receives an invalid or mismatched path → "format not recognised" error.
+
+**Planned fix:** Store extracted images using pure index-based names (`{zipIndex}_{imageIndex}.{ext}`) so original filenames have no influence on ordering or path resolution.

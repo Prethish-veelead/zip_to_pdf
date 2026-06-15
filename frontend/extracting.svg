@@ -1,0 +1,76 @@
+<svg width="100%" viewBox="0 0 680 200" role="img" xmlns="http://www.w3.org/2000/svg">
+  <title>Extracting and chunking loading animation</title>
+  <desc>A golden document splits apart into smaller chunks that slide outward, representing the extraction phase</desc>
+
+  <!-- Document shadow layers -->
+  <rect x="294" y="38" width="92" height="112" rx="6" fill="#7A5010" opacity="0.22"/>
+  <rect x="290" y="34" width="92" height="112" rx="6" fill="#C48820" opacity="0.18" stroke="#D4A020" stroke-width="1"/>
+
+  <!-- Main document body with pulse -->
+  <rect x="286" y="30" width="92" height="112" rx="6" fill="#E8A820" stroke="#F5C030" stroke-width="1.5">
+    <animate attributeName="opacity" values="0.12;0.26;0.12" dur="2s" repeatCount="indefinite"/>
+  </rect>
+
+  <!-- Document text lines -->
+  <g stroke="#FFD040" stroke-width="1.5" opacity="0.5">
+    <line x1="300" y1="52" x2="364" y2="52"/>
+    <line x1="300" y1="63" x2="364" y2="63"/>
+    <line x1="300" y1="74" x2="364" y2="74"/>
+    <line x1="300" y1="85" x2="355" y2="85"/>
+    <line x1="300" y1="96" x2="364" y2="96"/>
+    <line x1="300" y1="107" x2="364" y2="107"/>
+    <line x1="300" y1="118" x2="350" y2="118"/>
+    <line x1="300" y1="129" x2="364" y2="129"/>
+  </g>
+
+  <!-- Document header accent -->
+  <rect x="286" y="30" width="92" height="5" rx="2" fill="#FFE860" opacity="0.85"/>
+
+  <!-- Left chunks: fly out to the left -->
+  <g opacity="0.9">
+    <animateTransform attributeName="transform" type="translate"
+      values="0 0; -58 0; 0 0" keyTimes="0;0.55;1"
+      calcMode="spline" keySplines="0.3 0 0.5 1; 0.5 0 0.7 1"
+      dur="2s" repeatCount="indefinite"/>
+    <rect x="292" y="78" width="26" height="18" rx="3" fill="#D4900A" stroke="#FFD040" stroke-width="0.8">
+      <animate attributeName="opacity" values="0;0.9;0" dur="2s" repeatCount="indefinite"/>
+    </rect>
+    <rect x="292" y="99" width="36" height="14" rx="3" fill="#C47808" stroke="#FFD040" stroke-width="0.8">
+      <animate attributeName="opacity" values="0.15;0.88;0.15" dur="2s" repeatCount="indefinite"/>
+    </rect>
+    <rect x="292" y="116" width="28" height="14" rx="3" fill="#B86C08" stroke="#FFCA30" stroke-width="0.8">
+      <animate attributeName="opacity" values="0.15;0.86;0.15" dur="2s" repeatCount="indefinite"/>
+    </rect>
+  </g>
+
+  <!-- Right chunks: fly out to the right -->
+  <g opacity="0.9">
+    <animateTransform attributeName="transform" type="translate"
+      values="0 0; 58 0; 0 0" keyTimes="0;0.55;1"
+      calcMode="spline" keySplines="0.3 0 0.5 1; 0.5 0 0.7 1"
+      dur="2s" repeatCount="indefinite"/>
+    <rect x="322" y="78" width="42" height="18" rx="3" fill="#D4900A" stroke="#FFD040" stroke-width="0.8">
+      <animate attributeName="opacity" values="0;0.9;0" dur="2s" repeatCount="indefinite"/>
+    </rect>
+    <rect x="332" y="99" width="32" height="14" rx="3" fill="#C47808" stroke="#FFD040" stroke-width="0.8">
+      <animate attributeName="opacity" values="0.15;0.85;0.15" dur="2s" repeatCount="indefinite"/>
+    </rect>
+    <rect x="326" y="116" width="38" height="14" rx="3" fill="#B86C08" stroke="#FFCA30" stroke-width="0.8">
+      <animate attributeName="opacity" values="0.15;0.87;0.15" dur="2s" repeatCount="indefinite"/>
+    </rect>
+  </g>
+
+  <!-- Label -->
+  <text x="340" y="168" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="500" fill="#D4A020" letter-spacing="2">EXTRACTING</text>
+
+  <!-- Loading dots (sequential pulse) -->
+  <circle cx="432" cy="164" r="3" fill="#D4A020">
+    <animate attributeName="opacity" values="0.2;1;0.2" dur="1.2s" begin="0s" repeatCount="indefinite"/>
+  </circle>
+  <circle cx="443" cy="164" r="3" fill="#D4A020">
+    <animate attributeName="opacity" values="0.2;1;0.2" dur="1.2s" begin="0.3s" repeatCount="indefinite"/>
+  </circle>
+  <circle cx="454" cy="164" r="3" fill="#D4A020">
+    <animate attributeName="opacity" values="0.2;1;0.2" dur="1.2s" begin="0.6s" repeatCount="indefinite"/>
+  </circle>
+</svg>

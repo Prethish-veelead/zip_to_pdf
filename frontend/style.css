@@ -875,3 +875,14 @@ input { font-family: inherit; }
 .nav-item:active { background: rgba(255,255,255,0.05); }
 .nav-item svg { margin-bottom: 4px; }
 .nav-item.active { color: var(--accent); }
+
+/* Processing Animation */
+.processing-animation {
+  animation: pulse-float 2s ease-in-out infinite;
+}
+
+@keyframes pulse-float {
+  0% { transform: translateY(0) scale(1); }
+  50% { transform: translateY(-5px) scale(1.05); }
+  100% { transform: translateY(0) scale(1); }
+}

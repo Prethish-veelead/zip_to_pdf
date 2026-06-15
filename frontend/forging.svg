@@ -1,0 +1,62 @@
+<svg width="100%" viewBox="0 0 680 210" role="img" xmlns="http://www.w3.org/2000/svg">
+  <title>Forging and generating loading animation</title>
+  <desc>A golden hammer swings onto a glowing metal bar on an anvil, with sparks flying</desc>
+
+  <!-- Anvil shadow -->
+  <rect x="270" y="136" width="140" height="20" rx="4" fill="#7A5010" opacity="0.7"/>
+  <!-- Anvil body -->
+  <rect x="268" y="120" width="144" height="20" rx="5" fill="#C48820" opacity="0.85" stroke="#D4A020" stroke-width="0.8"/>
+  <!-- Anvil horn -->
+  <polygon points="268,124 242,130 268,136" fill="#C48820" opacity="0.7"/>
+
+  <!-- Glowing hot metal bar (pulses) -->
+  <rect x="282" y="112" width="96" height="11" rx="4" fill="#E8A820">
+    <animate attributeName="opacity" values="0.5;0.95;0.5" dur="0.8s" repeatCount="indefinite"/>
+  </rect>
+  <rect x="300" y="115" width="58" height="4" rx="2" fill="#FFF3A0">
+    <animate attributeName="opacity" values="0.3;0.65;0.3" dur="0.8s" repeatCount="indefinite"/>
+  </rect>
+
+  <!-- Impact flash (expands and fades at strike moment) -->
+  <circle cx="340" cy="113" fill="#FFD700">
+    <animate attributeName="r" values="2;2;14;2;2" keyTimes="0;0.32;0.42;0.56;1" dur="0.8s" repeatCount="indefinite"/>
+    <animate attributeName="opacity" values="0;0;0.75;0;0" keyTimes="0;0.32;0.42;0.56;1" dur="0.8s" repeatCount="indefinite"/>
+  </circle>
+
+  <!-- Hammer group: swings down and bounces (pivot at bottom of handle: 337,94) -->
+  <g>
+    <animateTransform attributeName="transform" type="rotate"
+      values="-20 337 94; 8 337 94; -20 337 94" keyTimes="0;0.4;1"
+      calcMode="spline" keySplines="0.4 0 0.2 1; 0.6 0 0.8 1"
+      dur="0.8s" repeatCount="indefinite"/>
+    <!-- Handle -->
+    <rect x="333" y="30" width="8" height="64" rx="3" fill="#B87A10"/>
+    <!-- Head -->
+    <rect x="308" y="12" width="64" height="22" rx="5" fill="#D4900A"/>
+    <!-- Head highlight -->
+    <rect x="316" y="16" width="48" height="7" rx="2" fill="#F5D060" opacity="0.45"/>
+  </g>
+
+  <!-- Progress bar (animates 40% → 90%) -->
+  <rect x="188" y="158" width="144" height="8" rx="4" fill="#3A2A08" opacity="0.5"/>
+  <rect x="188" y="158" height="8" rx="4" fill="#D4A020">
+    <animate attributeName="width" values="58;130;58" dur="2.4s" repeatCount="indefinite"
+      calcMode="spline" keySplines="0.4 0 0.6 1; 0.4 0 0.6 1"/>
+  </rect>
+  <text x="188" y="152" font-family="sans-serif" font-size="11" fill="#C4880A" font-weight="500">40%</text>
+  <text x="326" y="152" font-family="sans-serif" font-size="11" fill="#C4880A" font-weight="500">90%</text>
+
+  <!-- Label -->
+  <text x="340" y="186" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="500" fill="#D4A020" letter-spacing="2">FORGING</text>
+
+  <!-- Loading dots (sequential pulse) -->
+  <circle cx="420" cy="182" r="3" fill="#D4A020">
+    <animate attributeName="opacity" values="0.2;1;0.2" dur="1.2s" begin="0s" repeatCount="indefinite"/>
+  </circle>
+  <circle cx="431" cy="182" r="3" fill="#D4A020">
+    <animate attributeName="opacity" values="0.2;1;0.2" dur="1.2s" begin="0.3s" repeatCount="indefinite"/>
+  </circle>
+  <circle cx="442" cy="182" r="3" fill="#D4A020">
+    <animate attributeName="opacity" values="0.2;1;0.2" dur="1.2s" begin="0.6s" repeatCount="indefinite"/>
+  </circle>
+</svg>
